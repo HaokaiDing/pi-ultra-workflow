@@ -1,0 +1,228 @@
+/**
+ * Dual-role harness for the ultra-workflow scheduler.
+ *
+ * Named cli.js on purpose: index.ts re-invokes `process.argv[1]` and only accepts
+ * a Pi-looking entrypoint, so this file gets spawned as the "child" too. With
+ * `--mode json` it impersonates a Pi child and emits real NDJSON events; without
+ * it, it drives the scheduler. No LLM request is ever made.
+ */
+import { execSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const TMP = join(tmpdir(), "ultra-workflow-tests");
+const TRACE = join(TMP, "trace.ndjson");
+mkdirSync(TMP, { recursive: true });
+
+// ---------------- child role ----------------
+if (process.argv.includes("--mode")) {
+	const prompt = await new Promise((resolve) => {
+		let data = "";
+		process.stdin.setEncoding("utf8");
+		process.stdin.on("data", (chunk) => (data += chunk));
+		process.stdin.on("end", () => resolve(data));
+	});
+	const taskId = /Task ([A-Za-z0-9._-]+):/.exec(prompt)?.[1] ?? "unknown";
+	const trace = (event) => appendFileSync(TRACE, `${JSON.stringify({ taskId, event, at: Date.now() })}\n`);
+	trace("start");
+
+	const emit = (text, tokens, stopReason = "stop") => {
+		process.stdout.write(`${JSON.stringify({
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text }], usage: { totalTokens: tokens }, stopReason },
+		})}\n`);
+	};
+
+	if (prompt.includes("BEHAVIOR=slow")) await new Promise((r) => setTimeout(r, 1_500));
+	if (prompt.includes("BEHAVIOR=hang")) await new Promise((r) => setTimeout(r, 40_000));
+
+	if (prompt.includes("BEHAVIOR=fail")) {
+		process.stderr.write("simulated provider error\n");
+		emit("partial", 50, "aborted");
+		trace("end-fail");
+		process.exit(0);
+	}
+	if (prompt.includes("BEHAVIOR=empty")) {
+		emit("", 10);
+		trace("end-empty");
+		process.exit(0);
+	}
+	if (prompt.includes("BEHAVIOR=huge")) {
+		emit("H".repeat(30_000), 4_000);
+		trace("end-huge");
+		process.exit(0);
+	}
+	const deps = /<untrusted_workflow_evidence>\n([\s\S]*?)\n<\/untrusted_workflow_evidence>/.exec(prompt)?.[1] ?? "no-deps";
+	emit(`${taskId} ok deps=${deps.slice(0, 400)}`, prompt.includes("BEHAVIOR=big") ? 200_000 : 100);
+	trace("end-ok");
+	process.exit(0);
+}
+
+// ---------------- host role ----------------
+
+/** Locate the installed pi-coding-agent package without hardcoding a prefix. */
+function resolvePiRoot() {
+	if (process.env.PI_ROOT) return process.env.PI_ROOT;
+	const launcher = execSync("command -v pi", { encoding: "utf8" }).trim();
+	let dir = dirname(realpathSync(launcher));
+	for (let depth = 0; depth < 8; depth++) {
+		if (existsSync(join(dir, "dist", "core", "extensions", "loader.js"))) return dir;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	throw new Error("Cannot locate @earendil-works/pi-coding-agent; set PI_ROOT.");
+}
+
+const PI = resolvePiRoot();
+const EXT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const PROJ = join(TMP, "harness");
+mkdirSync(PROJ, { recursive: true });
+writeFileSync(join(PROJ, "package.json"), "{}\n");
+
+const { loadExtensions } = await import(`${PI}/dist/core/extensions/loader.js`);
+const loaded = await loadExtensions([join(EXT, "index.ts")], PROJ);
+if (loaded.errors.length > 0) {
+	console.log("LOADER ERRORS", loaded.errors.map((e) => String(e.error)));
+	process.exit(1);
+}
+const tool = loaded.extensions[0].tools.get("Workflow").definition;
+const ctx = { cwd: PROJ, hasUI: false };
+
+const results = [];
+const record = (name, pass, detail = "") => {
+	results.push({ name, pass, detail });
+	if (!pass) console.log(`FAIL  ${name}  -> ${String(detail).slice(0, 220)}`);
+};
+
+const run = async (input) => {
+	rmSync(TRACE, { force: true });
+	writeFileSync(TRACE, "");
+	try {
+		const out = await tool.execute("t", input, undefined, undefined, ctx);
+		return { ok: true, text: out.content[0].text, details: out.details };
+	} catch (error) {
+		return { ok: false, text: error instanceof Error ? error.message : String(error) };
+	}
+};
+const trace = () => readFileSync(TRACE, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
+
+// 1 - Parallel overlap inside one phase, plus the barrier before the next phase.
+{
+	const result = await run({
+		objective: "overlap",
+		phases: [
+			{ name: "scout", tasks: [task("a", "slow"), task("b", "slow"), task("c", "slow")] },
+			{ name: "synthesis", tasks: [task("final", "ok")] },
+		],
+	});
+	record("overlap run completed", result.ok, result.text);
+	if (result.ok) {
+		const events = trace();
+		const starts = events.filter((e) => e.event === "start" && e.taskId !== "final").map((e) => e.at);
+		const scoutEnds = events.filter((e) => e.event.startsWith("end") && e.taskId !== "final").map((e) => e.at);
+		const finalStart = events.find((e) => e.event === "start" && e.taskId === "final")?.at ?? 0;
+		const spread = Math.max(...starts) - Math.min(...starts);
+		record("3 scouts started concurrently", starts.length === 3 && spread < 1_400, `spread=${spread}ms`);
+		record("phase barrier holds", finalStart >= Math.max(...scoutEnds), `final=${finalStart} lastScoutEnd=${Math.max(...scoutEnds)}`);
+		record("tokens accumulate across all 4 children", result.details?.tokens === 400, `tokens=${result.details?.tokens}`);
+		const sawAll = ["a ok", "b ok", "c ok"].every((needle) => result.text.includes(needle));
+		record("synthesis received all 3 dependencies", sawAll, result.text.slice(-220));
+	}
+}
+
+// 2 - Concurrency cap: 5 queued tasks must never exceed 3 in flight.
+{
+	await run({ objective: "cap", phases: [{ name: "p", tasks: ["a", "b", "c", "d", "e"].map((id) => task(id, "slow")) }] });
+	const events = trace().sort((left, right) => left.at - right.at);
+	let inFlight = 0;
+	let peak = 0;
+	for (const event of events) {
+		if (event.event === "start") peak = Math.max(peak, ++inFlight);
+		else inFlight -= 1;
+	}
+	record("concurrency never exceeds 3", peak === 3, `peak=${peak}`);
+}
+
+// 3 - One failure degrades to an evidence gap; siblings and later phases continue.
+{
+	const result = await run({
+		objective: "degrade",
+		phases: [
+			{ name: "scout", tasks: [task("good1", "ok"), task("bad", "fail"), task("good2", "ok")] },
+			{ name: "synthesis", tasks: [task("final", "ok")] },
+		],
+	});
+	record("run survives one failed task", result.ok, result.text.slice(0, 200));
+	record("report names the evidence gap", /evidence gaps \(1\)/.test(result.text) && /bad:/.test(result.text), result.text.split("\n").find((l) => l.includes("gap")) ?? "");
+	record("failure diagnostic is carried", /did not finish cleanly/.test(result.text), "");
+	record("healthy siblings still ran", trace().filter((e) => e.event === "end-ok").length === 3, `${trace().filter((e) => e.event === "end-ok").length}`);
+	record("synthesis was reached", trace().some((e) => e.taskId === "final"), "");
+	record("synthesis prompt marked the gap unavailable", /unavailable/.test(result.text), result.text.slice(-260));
+}
+
+// 4 - Empty output fails; oversized output is trimmed instead of fatal.
+{
+	const result = await run({
+		objective: "trim",
+		phases: [{ name: "p", tasks: [task("huge", "huge"), task("blank", "empty")] }],
+	});
+	record("oversized answer does not kill the run", result.ok, result.text.slice(0, 200));
+	record("oversized answer is trimmed and labelled", /trimmed 6000 characters of 30000/.test(result.text), "");
+	record("trimmed flag reaches the report", /"trimmed":true/.test(result.text), "");
+	record("empty answer becomes a gap", /blank:.*returned no text/.test(result.text), result.text.split("\n").find((l) => l.includes("gap")) ?? "");
+}
+
+// 5 - Token ceiling stops dispatch and keeps what already arrived.
+{
+	const result = await run({
+		objective: "ceiling",
+		maxTotalTokens: 10_000,
+		phases: [
+			{ name: "spender", tasks: [task("big", "big"), task("cheap", "ok")] },
+			{ name: "blocked", tasks: [task("t2", "ok"), task("t3", "ok"), task("t4", "ok")] },
+		],
+	});
+	record("ceiling run still returns evidence", result.ok, result.text.slice(0, 200));
+	record("ceiling is reported", /Token ceiling of 10000 reached/.test(result.text), result.text.split("\n").find((l) => l.includes("stopped")) ?? "");
+	const started = trace().filter((e) => e.event === "start").map((e) => e.taskId);
+	record("ceiling blocked the whole next phase", ["t2", "t3", "t4"].every((id) => !started.includes(id)), `started=${started.join(",")}`);
+	record("undispatched tasks are listed as gaps", /never dispatched/.test(result.text), result.text.split("\n").find((l) => l.includes("gap")) ?? "");
+	record("evidence from before the ceiling survives", /big ok/.test(result.text), "");
+}
+
+// 6 - A wholly failed phase stops the run and says why.
+{
+	const result = await run({
+		objective: "allfail",
+		phases: [
+			{ name: "scout", tasks: [task("x", "fail"), task("y", "fail")] },
+			{ name: "synthesis", tasks: [task("final", "ok")] },
+		],
+	});
+	record("all-failed run throws", result.ok === false, result.text.slice(0, 200));
+	record("no-evidence message is explicit", /produced no evidence/.test(result.text), result.text.slice(0, 200));
+	record("later phase was skipped", trace().every((e) => e.taskId !== "final"), "");
+}
+
+// 7 - Per-task deadline fires; the healthy sibling is unaffected.
+{
+	const started = Date.now();
+	const result = await run({
+		objective: "deadline",
+		taskTimeoutSeconds: 30,
+		phases: [{ name: "p", tasks: [task("slowpoke", "hang"), task("ok1", "ok")] }],
+	});
+	const elapsed = Date.now() - started;
+	record("deadline run returns", result.ok, result.text.slice(0, 200));
+	record("deadline is per task", /exceeded its 30s deadline/.test(result.text), result.text.split("\n").find((l) => l.includes("gap")) ?? "");
+	record("deadline fired near 30s", elapsed > 28_000 && elapsed < 45_000, `${Math.round(elapsed / 1_000)}s`);
+	record("healthy sibling produced evidence", /ok1 ok/.test(result.text), "");
+}
+
+const failed = results.filter((r) => !r.pass);
+console.log(JSON.stringify({ total: results.length, passed: results.length - failed.length, failed: failed.length }, null, 1));
+process.exit(failed.length === 0 ? 0 : 1);
