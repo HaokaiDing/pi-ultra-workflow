@@ -174,7 +174,16 @@ function checkCommand(command: string, root: string): string | undefined {
 		const candidate = token.startsWith("-") ? flagValue(token) : token;
 		if (candidate === undefined) continue;
 		if (candidate.includes("..")) return `path traversal in "${token}"`;
-		const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root, false);
+		// A selector suffix hides the path from this check: `file.py::test_x` never
+		// resolves as a whole, so the lexical fallback waves it through, and pytest
+		// then strips the selector and follows the path — a symlink out of the
+		// workspace included. Check the path part. Splitting is safe for arguments
+		// that are not paths at all (`cargo test mod::case`): a name that resolves
+		// inside the workspace passes either way.
+		const bare = candidate.replace(/^["']|["']$/g, "");
+		const pathPart = bare.includes("::") ? bare.slice(0, bare.indexOf("::")) : bare;
+		if (pathPart === "") continue;
+		const { problem } = checkPath(pathPart, root, false);
 		if (problem) return problem;
 	}
 	return undefined;

@@ -53,7 +53,13 @@ const HOME = join(SHAPES, "home");
 mkdirSync(HOME, { recursive: true });
 // getAgentDir() also derives from HOME, so pin the real agent dir before swapping
 // it — otherwise the child guard path would move with the fake Home.
-process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+// A self-contained agent dir: the scheduler resolves the child guard under
+// <agentDir>/extensions/, so these tests must not depend on the extension being
+// installed anywhere. Built before HOME is swapped, since getAgentDir reads it.
+const AGENT_DIR = join(SHAPES, "agent");
+mkdirSync(join(AGENT_DIR, "extensions"), { recursive: true });
+symlinkSync(EXT, join(AGENT_DIR, "extensions", "ultra-workflow"), "dir");
+process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.HOME = HOME;
 
 // A plain folder of files two levels under Home, with no marker at all.
@@ -94,6 +100,11 @@ symlinkSync(join(PROJ, "src"), join(PROJ, "src-link"), "dir");
 // An ordinary-looking filename that is really a link out of the workspace.
 writeFileSync(join(TMP, "outside-plain.txt"), "secret from outside\n");
 symlinkSync(join(TMP, "outside-plain.txt"), join(PROJ, "plain.txt"), "file");
+// An external python test file reachable through an in-workspace symlink, for the
+// selector-suffix case: pytest strips `::test_x` and follows what is left.
+writeFileSync(join(TMP, "outside-test.py"), "def test_x(): pass\n");
+symlinkSync(join(TMP, "outside-test.py"), join(PROJ, "outside_test.py"), "file");
+writeFileSync(join(PROJ, "src", "real_test.py"), "def test_y(): pass\n");
 
 
 const results = [];
@@ -242,6 +253,12 @@ const guardCases = [
 	["bare-name symlink out blocked (nl)", "bash", { command: "nl plain.txt" }, true, true],
 	["dot-prefixed form was already blocked", "bash", { command: "head ./plain.txt" }, true, true],
 	["ordinary in-workspace file still allowed", "bash", { command: "wc -l src/a.ts" }, true, false],
+	// A selector suffix must not hide the path from the check.
+	["pytest node id on escaping symlink blocked", "bash", { command: "pytest outside_test.py::test_x" }, true, true],
+	["pytest class node id blocked", "bash", { command: "pytest outside_test.py::TestC::test_x" }, true, true],
+	["selector suffix on any command blocked", "bash", { command: "head outside_test.py::test_x" }, true, true],
+	["node id on in-workspace file allowed", "bash", { command: "pytest src/real_test.py::test_y" }, true, false],
+	["rust path filter is not a path", "bash", { command: "cargo test mymod::mycase" }, true, false],
 	["non-path argument still allowed", "bash", { command: "pytest -k smoke" }, true, false],
 	["unresolvable file path blocked for read", "read", { path: "does/not/exist.ts" }, false, true],
 	["#2 bracket glob blocked", "bash", { command: "head [a-z].pem" }, true, true],

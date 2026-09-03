@@ -7,7 +7,7 @@
  * it, it drives the scheduler. No LLM request is ever made.
  */
 import { execSync, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -176,7 +176,15 @@ function resolvePiRoot() {
 const PI = resolvePiRoot();
 const EXT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const PROJ = join(TMP, "harness");
-const RUNS = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "ultra-workflow", "runs");
+// A self-contained agent dir, so the harness runs whether or not the extension is
+// installed: the scheduler resolves the child guard under <agentDir>/extensions/.
+const AGENT_DIR = join(TMP, "agent");
+const LINK = join(AGENT_DIR, "extensions", "ultra-workflow");
+mkdirSync(join(AGENT_DIR, "extensions"), { recursive: true });
+rmSync(LINK, { recursive: true, force: true });
+symlinkSync(EXT, LINK, "dir");
+process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
+const RUNS = join(AGENT_DIR, "ultra-workflow", "runs");
 mkdirSync(PROJ, { recursive: true });
 writeFileSync(join(PROJ, "package.json"), "{}\n");
 
