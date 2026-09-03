@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-644 lines for the scheduler, 208 for the child boundary. It deliberately has no background mode, no locks and
+728 lines for the scheduler, 208 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -16,6 +16,7 @@ orchestration, with the deterministic phase structure of Claude Code's Dynamic W
 ## Install
 
 Requires Pi 0.84+ and a provider that serves the model in `MODEL` (default `openai-codex/gpt-5.6-sol`).
+Background delivery needs an interactive session; `pi --print` silently gets the foreground instead.
 
 ```bash
 git clone https://github.com/HaokaiDing/pi-ultra-workflow
@@ -49,14 +50,24 @@ The main agent calls one tool:
 ```
 
 - Phases run in order; tasks inside a phase run concurrently, at most 3 at once.
+- Each task is told the objective, its own scope, what its siblings own, and the answer shape to return —
+  the four things Anthropic's multi-agent write-up names as the fix for workers duplicating each other's work.
 - A task's `dependsOn` defaults to every task in the previous phase. Fan-in is not width-limited.
 - The last phase of a multi-phase run defaults to `max` effort plus Fast; everything else defaults to `high`.
   An explicit per-task `effort` overrides the default.
 - `shell: true` grants read-only shell access to that task. Off by default.
-- The call blocks until the run finishes and returns one report. Cancel by interrupting the tool call.
+- **The call returns immediately and the report is delivered when the run finishes.** Start it, then do other
+  work — do not poll. Pass `background: false` to block instead. A non-interactive host (`pi --print`) silently
+  gets the foreground, since that process exits when the turn ends and would throw the report away.
 - A per-run journal lands in `~/.pi/agent/ultra-workflow/runs/<run-id>.json`.
 
 Defaults: 8 tasks, 4 phases, 3 concurrent, 300 s per task, 250 000 tokens per run.
+
+Any project directory works. A marker (`.git`, `package.json`, `pyproject.toml`, `Makefile`, …) at or above the
+directory settles it; failing that, any directory nested at least two levels under Home counts, since plenty of
+real projects are just a folder of files. Refused: Home itself, a directory that only holds other projects
+(`Documents`, `Downloads`, …), credential directories, and — outside Home — anything without a marker, where
+an empty `.pi-workflow-root` file opts it in.
 
 ## Child boundary
 
@@ -137,8 +148,8 @@ Behavioural choices worth knowing:
 No dependencies, no network, no API calls.
 
 ```bash
-node tests/verify.mjs          # 123 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 37 checks: real spawns via a stub child (~50s, includes a 30s deadline)
+node tests/verify.mjs          # 127 checks: loading, tool contract, planner, guard boundaries
+node tests/harness/cli.js      # 49 checks: real spawns via a stub child (~60s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only

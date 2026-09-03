@@ -42,11 +42,33 @@ writeFileSync(join(PROJ, "scripts", "check.py"), "print(1)\n");
 // A directory with no project marker anywhere above it inside the temp root.
 // A link that lives inside the workspace but points out of it, plus a benign one.
 symlinkSync("/etc", join(PROJ, "escape"), "dir");
+// Directory shapes that mirror real project layouts, to pin the workspace rule.
+const HOME = homedir();
+const SHAPES = join(TMP, "shapes");
+rmSync(SHAPES, { recursive: true, force: true });
+// A plain folder of files two levels under Home, with no marker at all.
+const nestedNoMarker = join(HOME, ".pi-wf-test-shapes", "some-paper");
+rmSync(join(HOME, ".pi-wf-test-shapes"), { recursive: true, force: true });
+mkdirSync(nestedNoMarker, { recursive: true });
+writeFileSync(join(nestedNoMarker, "draft.tex"), "\\documentclass{article}\n");
+// One level under Home, no marker.
+const shallowNoMarker = join(HOME, ".pi-wf-test-shallow");
+rmSync(shallowNoMarker, { recursive: true, force: true });
+mkdirSync(shallowNoMarker, { recursive: true });
+// Outside Home, no marker.
+const outsideNoMarker = join(SHAPES, "outside");
+mkdirSync(outsideNoMarker, { recursive: true });
+// Outside Home, explicitly opted in.
+const outsideOptedIn = join(SHAPES, "opted-in");
+mkdirSync(outsideOptedIn, { recursive: true });
+writeFileSync(join(outsideOptedIn, ".pi-workflow-root"), "");
+// An umbrella directory that happens to sit under a marker-bearing parent.
+const umbrella = join(HOME, ".pi-wf-test-shapes", "Documents");
+mkdirSync(umbrella, { recursive: true });
+
+
 symlinkSync(join(PROJ, "src"), join(PROJ, "src-link"), "dir");
 
-const NOMARKER = join(TMP, "nomarker", "deep");
-rmSync(join(TMP, "nomarker"), { recursive: true, force: true });
-mkdirSync(NOMARKER, { recursive: true });
 
 const results = [];
 const record = (name, pass, detail = "") => results.push({ name, pass, detail });
@@ -68,9 +90,11 @@ record("registers no slash command", (extension?.commands?.size ?? 0) === 0, Str
 // ---------- 2. Planner and workspace rejections (no child is spawned) ----------
 const ctx = { cwd: PROJ, hasUI: false };
 const task = (id, dependsOn) => ({ id, prompt: `do ${id}`, ...(dependsOn ? { dependsOn } : {}) });
+// Validation cases run in the foreground: a background call returns before the
+// scheduler ever reaches spawn, so its errors would arrive by wake-up instead.
 const call = async (input, useCtx = ctx) => {
 	try {
-		await tool.execute("t1", input, undefined, undefined, useCtx);
+		await tool.execute("t1", { ...input, background: false }, undefined, undefined, useCtx);
 		return "ACCEPTED";
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
@@ -99,10 +123,22 @@ record("non-Pi host cannot spawn children", /is not a Pi entrypoint/.test(spawnG
 for (const [name, cwd, pattern] of [
 	["Home workspace rejected", homedir(), /Home or an ancestor/],
 	["credential dir rejected", join(homedir(), ".pi", "agent"), /protected config or credential/],
-	["unmarked dir rejected", NOMARKER, /project marker/],
+	["outside Home without marker rejected", outsideNoMarker, /no project marker/],
+	["directly in Home without marker rejected", shallowNoMarker, /directly in Home/],
+	["umbrella dir rejected by name", umbrella, /holds projects rather than being one/],
 ]) {
 	const message = await call(plan2, { cwd, hasUI: false });
 	record(name, pattern.test(message), message.slice(0, 120));
+}
+
+// Workspace shapes that must be accepted. They reach the planner, so a plan
+// error (not a workspace error) proves the workspace itself passed.
+for (const [name, cwd] of [
+	["nested folder of files under Home accepted", nestedNoMarker],
+	["outside Home with .pi-workflow-root accepted", outsideOptedIn],
+]) {
+	const message = await call({ objective: "o", phases: [{ name: "p", tasks: [task("a")] }] }, { cwd, hasUI: false });
+	record(name, /adds nothing/.test(message), message.slice(0, 110));
 }
 
 // ---------- 3. Guard boundaries ----------

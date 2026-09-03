@@ -24,7 +24,12 @@ if (process.argv.includes("--mode")) {
 		process.stdin.on("data", (chunk) => (data += chunk));
 		process.stdin.on("end", () => resolve(data));
 	});
-	const taskId = /Task ([A-Za-z0-9._-]+):/.exec(prompt)?.[1] ?? "unknown";
+	// The scheduler now wraps each task and also lists the sibling tasks under
+	// <other_workers>, so behaviour has to be read from this worker's own section
+	// only — otherwise a sibling's BEHAVIOR= leaks into every child.
+	const own = /<your_task id="([A-Za-z0-9._-]+)"[^>]*>([\s\S]*?)<\/your_task>/.exec(prompt);
+	const taskId = own?.[1] ?? "unknown";
+	const mine = own?.[2] ?? "";
 	const trace = (event) => appendFileSync(TRACE, `${JSON.stringify({ taskId, event, at: Date.now() })}\n`);
 	trace("start");
 
@@ -35,33 +40,33 @@ if (process.argv.includes("--mode")) {
 		})}\n`);
 	};
 
-	if (prompt.includes("BEHAVIOR=slow")) await new Promise((r) => setTimeout(r, 1_500));
-	if (prompt.includes("BEHAVIOR=hang")) await new Promise((r) => setTimeout(r, 40_000));
+	if (mine.includes("BEHAVIOR=slow")) await new Promise((r) => setTimeout(r, 1_500));
+	if (mine.includes("BEHAVIOR=hang")) await new Promise((r) => setTimeout(r, 40_000));
 
-	if (prompt.includes("BEHAVIOR=fail")) {
+	if (mine.includes("BEHAVIOR=fail")) {
 		process.stderr.write("simulated provider error\n");
 		emit("partial", 50, "aborted");
 		trace("end-fail");
 		process.exit(0);
 	}
-	if (prompt.includes("BEHAVIOR=empty")) {
+	if (mine.includes("BEHAVIOR=empty")) {
 		emit("", 10);
 		trace("end-empty");
 		process.exit(0);
 	}
-	if (prompt.includes("BEHAVIOR=huge")) {
+	if (mine.includes("BEHAVIOR=huge")) {
 		emit("H".repeat(30_000), 4_000);
 		trace("end-huge");
 		process.exit(0);
 	}
 	// Escape-inflating payload: every "<" becomes six characters after safeJson.
-	if (prompt.includes("BEHAVIOR=hostile")) {
+	if (mine.includes("BEHAVIOR=hostile")) {
 		emit("<".repeat(24_000), 500);
 		trace("end-hostile");
 		process.exit(0);
 	}
 	// Multi-round tool loop: streamed usage plus two toolUse turns before the end.
-	if (prompt.includes("BEHAVIOR=multiround")) {
+	if (mine.includes("BEHAVIOR=multiround")) {
 		process.stdout.write(`${JSON.stringify({ type: "message_update", usage: { totalTokens: 40_000 } })}\n`);
 		emit("thinking", 60_000, "toolUse");
 		emit("still thinking", 60_000, "toolUse");
@@ -71,7 +76,7 @@ if (process.argv.includes("--mode")) {
 		process.exit(0);
 	}
 	const deps = /<untrusted_workflow_evidence>\n([\s\S]*?)\n<\/untrusted_workflow_evidence>/.exec(prompt)?.[1] ?? "no-deps";
-	emit(`${taskId} ok deps=${deps.slice(0, 400)}`, prompt.includes("BEHAVIOR=big") ? 200_000 : 100);
+	emit(`${taskId} ok deps=${deps.slice(0, 400)}`, mine.includes("BEHAVIOR=big") ? 200_000 : 100);
 	trace("end-ok");
 	process.exit(0);
 }
@@ -117,7 +122,10 @@ const run = async (input) => {
 	rmSync(TRACE, { force: true });
 	writeFileSync(TRACE, "");
 	try {
-		const out = await tool.execute("t", input, undefined, undefined, ctx);
+		// The scheduler assertions need the run finished before they read the trace,
+		// so the harness drives it in the foreground. Background delivery is covered
+		// by its own case below.
+		const out = await tool.execute("t", { ...input, background: false }, undefined, undefined, ctx);
 		return { ok: true, text: out.content[0].text, details: out.details };
 	} catch (error) {
 		return { ok: false, text: error instanceof Error ? error.message : String(error) };
@@ -278,6 +286,80 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("partial-dependency run returns", result.ok, result.text.slice(0, 160));
 	record("orphaned evidence is flagged", /unused evidence \(1\).*a2/.test(result.text), result.text.split("\n").find((l) => l.includes("unused")) ?? "(no unused line)");
 	record("consumed evidence is not flagged", !/unused evidence.*a1/.test(result.text), "");
+}
+
+// 11 - Background mode returns immediately and delivers via sendMessage.
+{
+	// Load a second instance with a sendMessage spy: the delivery call is what
+	// carries the report back to the session, so its arguments are the contract.
+	const delivered = [];
+	// Resolve the aliases the way Pi's own loader does, from inside the Pi package.
+	const { createRequire } = await import("node:module");
+	const piRequire = createRequire(`${PI}/dist/core/extensions/loader.js`);
+	const factory = (await import(`${PI}/node_modules/jiti/lib/jiti.mjs`))
+		.createJiti(import.meta.url, {
+			moduleCache: false,
+			alias: {
+				typebox: piRequire.resolve("typebox"),
+				"@earendil-works/pi-coding-agent": `${PI}/dist/index.js`,
+			},
+		});
+	const build = await factory.import(join(EXT, "index.ts"), { default: true });
+	let spyTool;
+	build({
+		registerTool: (definition) => { if (definition.name === "Workflow") spyTool = definition; },
+		on: () => {},
+		sendMessage: (message, options) => delivered.push({ message, options }),
+	});
+
+	rmSync(TRACE, { force: true });
+	writeFileSync(TRACE, "");
+	await spyTool.execute("spy", {
+		objective: "delivery contract",
+		phases: [{ name: "p", tasks: [task("d1", "ok"), task("d2", "ok")] }],
+	}, undefined, undefined, { ...ctx, hasUI: true });
+	for (let waited = 0; waited < 40 && delivered.length === 0; waited++) {
+		await new Promise((r) => setTimeout(r, 250));
+	}
+	record("background delivery calls sendMessage exactly once", delivered.length === 1, `${delivered.length} calls`);
+	record("delivery triggers a new turn", delivered[0]?.options?.triggerTurn === true, JSON.stringify(delivered[0]?.options));
+	record("delivery arrives as a follow-up", delivered[0]?.options?.deliverAs === "followUp", JSON.stringify(delivered[0]?.options));
+	record("delivered content is the full report", /tasks produced evidence/.test(delivered[0]?.message?.content ?? ""), (delivered[0]?.message?.content ?? "").slice(0, 70));
+	record("delivered content carries the evidence", /d1 ok/.test(delivered[0]?.message?.content ?? "") && /d2 ok/.test(delivered[0]?.message?.content ?? ""), "");
+	record("delivery is displayed to the user", delivered[0]?.message?.display === true, String(delivered[0]?.message?.display));
+
+	rmSync(TRACE, { force: true });
+	writeFileSync(TRACE, "");
+	const started = Date.now();
+	// hasUI: true is what marks an interactive session; without it the scheduler
+	// deliberately falls back to the foreground (verified by the assertions above
+	// running green under the default ctx).
+	const out = await tool.execute("bg", {
+		objective: "background",
+		phases: [{ name: "p", tasks: [task("b1", "slow"), task("b2", "slow")] }],
+	}, undefined, undefined, { ...ctx, hasUI: true });
+	const returnedIn = Date.now() - started;
+	record("background call returns immediately", returnedIn < 1_200, `${returnedIn}ms`);
+	record("background call reports a run id", /Started wf-/.test(out.content[0].text), out.content[0].text.slice(0, 90));
+	record("background call is flagged in details", out.details?.background === true, JSON.stringify(out.details));
+
+	// Wait for the children to finish so the session-level state is clean.
+	for (let waited = 0; waited < 30 && trace().filter((e) => e.event.startsWith("end")).length < 2; waited++) {
+		await new Promise((r) => setTimeout(r, 500));
+	}
+	record("background run actually ran its children", trace().filter((e) => e.event.startsWith("end")).length === 2, `${trace().filter((e) => e.event.startsWith("end")).length}/2`);
+
+	// A non-interactive host must not get background delivery: that process exits
+	// when the turn ends and the report would be thrown away.
+	rmSync(TRACE, { force: true });
+	writeFileSync(TRACE, "");
+	const printMode = await tool.execute("pm", {
+		objective: "print mode",
+		phases: [{ name: "p", tasks: [task("p1", "ok"), task("p2", "ok")] }],
+	}, undefined, undefined, { ...ctx, hasUI: false });
+	record("non-interactive host falls back to foreground", /tasks produced evidence/.test(printMode.content[0].text), printMode.content[0].text.slice(0, 80));
+	record("foreground fallback is not flagged as background", printMode.details?.background === undefined, JSON.stringify(printMode.details));
+	void delivered;
 }
 
 const failed = results.filter((r) => !r.pass);
