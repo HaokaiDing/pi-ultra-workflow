@@ -1,73 +1,75 @@
-# 审计任务书 · pi-ultra-workflow（第 3 轮 · 只审调度层）
+# 审查任务书 · pi-ultra-workflow（第 4 轮）
 
-给独立 reviewer（codex）的自包含上下文。目标是找**这一轮新增代码里还没被发现的缺陷**。
+给独立 reviewer 的自包含上下文。目标是找**当前代码里还没被发现的缺陷**。前三轮加上一轮自审共处置了 30 余条，都列在下面的排除项里。
 
-## 本轮范围
+## 范围
 
-**只审 `index.ts`（728 行）的调度层**，以及 `tests/` 里对它的覆盖。
+`index.ts`（817 行）与 `child-guard.ts`（236 行），以及 `tests/` 里对它们的覆盖。**两个文件都在范围内** —— 上一轮刚各改了 5 处和 2 处。
 
-**明确不在本轮范围内：`child-guard.ts` 和 shell 命令策略。** 第 2 轮已经查明那套 per-option 策略覆盖不了无界的选项空间（22 条边界形式全部放行），结论已写进 README 的 known limitations：shell 策略是粗筛，适合审自己的代码，不适用于不信任的代码。把它改成固定命令模板是独立的一轮工作，本轮不要花时间，也不要重复报那 22 条。
+只读审查。**禁止修改任何文件，禁止 commit，禁止运行真 `pi` 会话**（会消耗订阅额度）。`tests/verify.mjs`（135 项）与 `tests/harness/cli.js`（68 项）可以跑，它们不发 provider 请求。不要写 `.md` 文件，结论直接回复。
 
-只读审计。**禁止修改任何文件，禁止 commit，禁止运行真 `pi` 会话**（会消耗订阅额度）。`tests/verify.mjs`（127 项）和 `tests/harness/cli.js`（49 项）可以跑，它们不发任何 provider 请求。不要写 `.md` 文件，结论直接回复。
+## 审查性质
+
+核对"实现出的行为"与"声明的意图"是否一致。意图有两条：child 只读、且只作用于 workspace 内。用规则文件与命令文档逐条推理，**不要构造或运行破坏性命令**。需要核实某条规则的判定时，把 `child-guard.ts` 的 default export 单独 import 出来喂普通字符串取返回值即可（`tests/verify.mjs` 里有现成的 jiti 加载写法）；临时脚本写 `/tmp` 下不用清理，也不要用 `rm`。
 
 ## 它是什么
 
-Pi 的一个 extension，注册单个 `Workflow` tool。主 agent 传入 phase 列表，调度器 spawn 若干只读 child（`pi --mode json --print` 子进程），phase 之间串行、phase 内最多 3 并发，最后把证据汇总成一份报告。
+Pi 的 extension，注册单个 `Workflow` tool。主 agent 传 phase 列表，调度器 spawn 若干只读 child（`pi --mode json --print` 子进程），phase 间串行、phase 内最多 3 并发，最后汇总成一份报告。TUI 会话下默认后台交付（`sendMessage` + `triggerTurn`），其他宿主自动降级为前台。
 
-**默认后台交付**：tool 立刻返回 run id，跑完用 `pi.sendMessage({triggerTurn: true, deliverAs: "followUp"})` 把报告送回会话。已在真实交互式会话端到端验证过（tool 返回 → 主 agent 结束回合 → 14 秒后报告自己抵达 → 主 agent 读到）。非交互宿主（`pi --print`）自动降级为前台，因为那种进程在回合结束时退出，会取消 run 并丢掉报告（实测：138 token 花掉、产出为零）。
-
-## 刻意的设计取舍 —— 不是缺陷，别报
+## 刻意的取舍 —— 不是缺陷，别报
 
 1. 无跨进程锁、无 resume、无状态版本迁移。状态 JSON 只是事后日志，`writeLog` 整个 try/catch 吞错，永不参与控制流。
-2. 失败降级：单 child 失败记为证据缺口，兄弟继续、后续 phase 继续；只有某 phase 全灭或全部 task 失败才终止。
-3. 输出超限截断标注，不判失败。
+2. 失败降级：单 child 失败记为证据缺口，兄弟与后续 phase 继续；只有某 phase 全灭或全部 task 失败才终止。
+3. 输出超限截断标注，不判失败；撞 per-task 预算同样保留已有答案。
 4. 固定并发 `min(taskCount, 3)`，无爬坡。
-5. 同一会话一次只允许一个 run（`active` 计数）。
-6. 禁止 child 递归派发（`PI_ULTRA_WORKFLOW_CHILD` 环境变量守卫）。
-7. `MODEL` 硬编码为单一常量。
-8. 任务数由调用方按 prompt 里的规模阶梯自行决定，代码只兜硬上限（`MAX_TASKS=8`、`CONCURRENCY=3`）。这是照 Anthropic 的做法：prompt 引导加确定性上限，两者都要，**不做独立的规划 agent**。
+5. 同一会话一次只允许一个 run。
+6. 禁止 child 递归派发（`PI_ULTRA_WORKFLOW_CHILD` 守卫）。
+7. `MODEL` 硬编码。
+8. 任务数由调用方按 prompt 里的规模阶梯决定，代码只兜硬上限（`MAX_TASKS=8`、`CONCURRENCY=3`）。不做独立的规划 agent。
+9. token 计数把每个 response 的 `totalTokens`（含 `cacheRead`）逐轮求和。这**高估**了计费成本（缓存前缀每次请求都计一次），刻意偏向早停。
+10. shell 命令策略是**粗筛**，不是边界。已知放行大量选项组合，结论见 README known limitations。适合审自己的代码，不适用于不信任的代码。把它改成固定命令模板是独立的一轮工作 —— **本轮不要报 shell 命令白名单的覆盖面问题**，也不要重复那 22 条已记录的边界形式。
 
 ## 已知限制 —— 已承认，别重复报
 
-1. `maxTotalTokens` 是派发闸门加 in-flight 估算，不是硬上限；已派发的 task 会跑完。
+1. `maxTotalTokens` 是派发闸门；`maxTokensPerTask`（默认 80000）才是可执行的上限。最坏约为 per-task 上限乘并发数。
 2. Pi 无任何内置 web/fetch 工具，child 不能联网。
 3. macOS / Linux only，Windows 在 tool 入口 fail-fast。
 4. `git log -p` 会打印历史里的文件内容，包括受保护的文件名。
-5. shell 策略是粗筛（见上文范围说明）。
+5. 后台 run 在 `session_shutdown` 时被取消，报告只留日志。
 
-## 前两轮已修 —— 别当新发现报
+## 已修 —— 别当新发现报
 
-涉及：`registerTool` 返回的 `isError` 被 Pi 无条件丢弃（已全改 `throw`）、phase 级连坐终止、无 token 上限、输出超限判失败、全局单一 deadline、路径归一化与 Pi 不一致、多轮 `toolUse` 的 token 对预算不可见、`exit` 兜底未清理子进程、被 ceiling 留成 `pending` 的 task 让上游证据算作已消费、报告长度在转义前计算、`slice` 劈开 surrogate pair、同 phase 重复 task id、`piInvocation` 无入口校验、Windows 分支静默失效。
+**路径与 guard**：与 Pi 归一化不一致（`file://`、`@`、Unicode 空格、`~`）；指向 workspace 外的 symlink；未解析路径退回词法检查（现对文件工具直接拒绝，shell 参数仍走词法）；递归 `grep` 读到受保护后代（现要求单文件）；`grep` 凭据 pattern；workspace 判据放行 `~/.config`、`~/.docker`、`~/Library`（含 CloudStorage 与 iCloud）；误拒名为 `tmp` 的真项目；glob 展开在检查之后；`git show HEAD:.env`；`npm publish`/`install`、`cargo install`；`git branch`/`tag` 被当只读；带值选项跳过路径检查；`--pre`/`--pyargs`/`--exec-path` 等外部执行开关；全局 flag 黑名单误伤 `git log -p`、`head -c`、`pytest -m`。
 
-## 请重点审这些（全部是本轮新增）
+**调度层**：`registerTool` 返回的 `isError` 被 Pi 丢弃（已全改 `throw`）；phase 级连坐终止；无 token 上限；输出超限判失败；全局单一 deadline；多轮 `toolUse` 的 token 对预算不可见；`exit` 兜底未清理子进程；SIGKILL 升级被"leader 还活着"挡住；事件流超限后继续 buffer；已 settle 的 child 用尾部残片重建预算占用；预算 reservation 写在 `spawn` 可能抛错之前；被 ceiling 留成 `pending` 的 task 让上游证据算作已消费；报告与 fan-in 的长度在转义前计算；`slice` 劈开 surrogate pair；`phase.name` 未转义进 header；诊断未序列化进报告；同 phase 重复 task id；`piInvocation` 无入口校验；`hasUI` 被误用作宿主生命周期判据（改 `ctx.mode`）；shutdown 时反向触发 provider turn；Windows 分支静默失效；两处不可达分支。
 
-1. **后台交付的 promise 链**（`index.ts` 尾部 `execute` 分支）。形状是 `void execute(...).then(text=>text, error=>msg).then(deliver).finally(settle)`。请判断：`settle` 是否恰好执行一次（`active` 计数会不会漂）；`sendMessage` 抛错时报告只剩日志（我用 try/catch 吞了）这样处理是否可接受；后台 run 与 `liveChildren` 集合的生命周期是否一致。
+**一条被推翻又改回的**：`usage.totalTokens` 曾被误判为会话累计值、求和改成取最大值。它其实是单次请求的 `input + output + cacheRead + cacheWrite`，看起来像累计只因 `cacheRead` 随对话增长。已改回求和。
 
-2. **`ctx.hasUI` 作为降级判据**。`input.background !== false && ctx.hasUI === true` 才走后台。请核对 Pi 里 `hasUI` 的真实语义（`dist/core/extensions/types.d.ts` 附近）：有没有"交互式会话但 hasUI 为 false"或反之的情形，会让这个判断反向。
+## 请重点审这些
 
-3. **后台 run 与 `session_shutdown` 的交互**。shutdown 时 abort 所有 controller、terminate `liveChildren`、等 500ms 再 SIGKILL。后台 run 此时被取消、报告丢失（只留日志）。请评估这个语义是否合理，以及有没有让 shutdown 挂住或让子进程逃过清理的路径。
+1. **进程组升级的新时序**（`index.ts` 的 `terminate`）。现在是：SIGTERM → 挂一个 5 秒 timer → 在 `exit` 事件立即杀组 → 在 `close` 事件清掉 timer。理由是既要处理"leader 退出而后代忽略 SIGTERM"，又不能在 OS 可能复用 pid 之后还持有它。请找出这个时序仍会漏杀或误杀的情形，特别是 `exit` 与 `close` 的先后、以及 `escalate` 被调用两次的后果。
 
-4. **同一会话单 run 的锁定代价**。后台 run 期间 `active > 0`，第二个 `Workflow` 调用被拒。最坏 4 phase × 300s per task，会话可能被锁十几分钟。请判断：有没有让 `active` 永不归零的路径（那会永久锁死会话）；这个取舍是否需要一个逃生口。
+2. **`checkPath` 的 `requireResolve` 两个调用点**（`child-guard.ts`）。文件工具传 `true`（不解析即拒），shell 参数传 `false`（保留词法检查）。请核对这个划分：有没有文件工具的路径本该允许不存在的情形；shell 侧保留词法检查是否留下了能读到 workspace 外文件的具体写法。
 
-5. **in-flight 记账的真实上界**。当前：spawn 前按 `prompt.length / 4` 垫下界；`message_update` 时取 `Math.max(已有, 已完成轮 tokens + 本轮 live)`；`message_end` 若 `stopReason === "toolUse"` 保留 `tokens` 否则删除；失败时把 `Math.max(tokens, inFlight)` 计入总量。请判断真实上界，以及有没有让 `inFlight` 条目永久残留、从而永久占用预算阻断后续派发的路径。
+3. **`grep` 限单文件之后的等价绕过**。`grep` 现在必须指定单个文件且不能是目录。`find` 与 `ls` 仍可作用于目录（它们只列名字不读内容）。请判断这个区分是否站得住：`find`/`ls`/`read` 的组合能否达到"批量读取受保护文件内容"的同等效果。
 
-6. **报告收缩迭代的收敛性**。按 `MAX_REPORT_CHARS / chosen.length` 算份额、构建、若 `safeJson` 后超限则按实际比例收缩，最多 3 轮，份额下界 256。我的论证是必然收敛：256 × 最多 8 task × 最坏 6 倍转义膨胀 ≈ 13k < 48k。请证伪或确认，并尝试构造 3 轮后仍超限的输入。
+4. **per-task 预算的两个检查点**。`message_update` 时按 `tokens + live` 判、`message_end` 时按累加后的 `tokens` 判，撞上限则终止并保留已有文本。请判断真实上界，以及有没有让 `inFlight` 条目残留、或让预算判定被单个超长 response 绕过的路径。
 
-7. **新的 workspace 判据**。顺序是：拒 Home 及其祖先 → 拒含敏感段的路径 → 拒 `UMBRELLA_DIRS` 里的目录名 → 有 marker（往上 12 层）则放行 → 否则若在 Home 下且深度 ≥ 2 则放行 → 否则要求 `.pi-workflow-root`。请找出反直觉的判定：应该放行却被拒、或应该拒却放行的真实目录形状。特别是符号链接下的 Home、`UMBRELLA_DIRS` 的大小写与本地化目录名、以及 `depth >= 2` 在深层嵌套 Home 布局下的表现。
+5. **后台交付路径**。tool 立刻返回 run id，跑完 `sendMessage({triggerTurn: true, deliverAs: "followUp"})`；run 被 abort 时不投递。请找 `active` 计数漂移、投递重复、或报告在非 shutdown 情形下丢失的路径。
 
-8. **委派契约的 prompt 构造**。每个 child 的 prompt 现在含 objective、自己的任务、`<other_workers>`（同 phase 兄弟的 id 与任务描述前 160 字符）、`<untrusted_workflow_evidence>`（上游证据）。请评估：把兄弟的任务描述注入每个 child 有什么副作用（prompt 体积、以及兄弟描述里的文本被 child 当成自己待办的可能）；`<other_workers>` 的措辞是否足以让它被读成边界说明。
+6. **报告汇总的边界**。转义后的份额收缩、`unused` 检测（只有 completed 的 task 算消费了上游）、`lastPhase` 选取。请构造能让有效证据静默消失或报告超出 `MAX_REPORT_CHARS` 的输入。
 
-9. **`clip()` 的字符边界**。只去掉尾部孤立的高代理，不处理组合字符与 ZWJ emoji 序列。请表态是否值得修。
+7. **死代码与可合并的重复**。`index.ts` 与 `child-guard.ts` 里还有没有无人调用的函数、不可达分支、或两处几乎相同的逻辑。给出调用路径依据。
 
 ## 硬约束
 
 - 不要建议加 hash / checksum / 完整性链。
 - 不要建议把跨进程锁、resume、状态版本迁移、并发爬坡加回来。
 - 不要建议引入运行时依赖（当前零依赖，只用 Node 内置模块 + Pi 自带的 typebox）。
-- 不要建议做独立的规划 agent 来决定任务数（见取舍 8）。
-- 不要碰 `child-guard.ts` 与 shell 策略（见范围说明）。
+- 不要建议做独立的规划 agent 决定任务数。
+- 不要报 shell 命令白名单的覆盖面（见取舍 10）。
 - 防御要成比例：不为基本不可能发生的情况加分支、断言或 try/except。
 
 ## 交付格式
 
-每条 finding 给：`文件:行号 → 一句话缺陷 → 触发条件 → 后果 → 最小修补（≤5 行代码）`。按严重度排序，最多 10 条。判定"实现正确"的项也用一行说明依据。第 3、4、6、9 项无论结论如何都必须明确表态并给理由。最后一句总体判断：调度层能不能直接用，最该先修哪一条。
+每条给：`文件:行号 → 一句话缺陷 → 触发条件 → 后果 → 最小修补（≤5 行代码）`。按严重度排序，最多 10 条。判定"实现正确"的项用一行说明依据。第 1、3、7 项无论结论如何都要明确表态。最后一句总体判断：能不能直接用，最该先修哪一条。

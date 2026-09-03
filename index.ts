@@ -327,19 +327,26 @@ function terminate(proc: ChildProcessWithoutNullStreams): void {
 		}
 	};
 	signalTree("SIGTERM");
-	setTimeout(() => {
-		// Not gated on the leader still being alive: once it exits, exitCode is set
-		// while descendants that ignored SIGTERM keep running. Signal the group.
-		if (proc.pid !== undefined && process.platform !== "win32") {
-			try {
-				process.kill(-proc.pid, "SIGKILL");
-				return;
-			} catch {
-				// The group is gone, or this platform refused it.
-			}
+
+	// Escalation has to handle the case the old check got backwards — a leader that
+	// exits while descendants ignore SIGTERM — without holding a pid past the point
+	// where the OS may have reused it. So: kill the group the moment the leader
+	// exits, and cancel the timer once stdio closes.
+	const escalate = () => {
+		if (proc.pid === undefined || process.platform === "win32") {
+			if (proc.exitCode === null && proc.signalCode === null) signalTree("SIGKILL");
+			return;
 		}
-		if (proc.exitCode === null && proc.signalCode === null) signalTree("SIGKILL");
-	}, 5_000).unref();
+		try {
+			process.kill(-proc.pid, "SIGKILL");
+		} catch {
+			// The group is already gone.
+		}
+	};
+	const escalation = setTimeout(escalate, 5_000);
+	escalation.unref();
+	proc.once("exit", escalate);
+	proc.once("close", () => clearTimeout(escalation));
 }
 
 interface ChildOutcome {
