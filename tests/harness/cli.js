@@ -54,6 +54,22 @@ if (process.argv.includes("--mode")) {
 		trace("end-huge");
 		process.exit(0);
 	}
+	// Escape-inflating payload: every "<" becomes six characters after safeJson.
+	if (prompt.includes("BEHAVIOR=hostile")) {
+		emit("<".repeat(24_000), 500);
+		trace("end-hostile");
+		process.exit(0);
+	}
+	// Multi-round tool loop: streamed usage plus two toolUse turns before the end.
+	if (prompt.includes("BEHAVIOR=multiround")) {
+		process.stdout.write(`${JSON.stringify({ type: "message_update", usage: { totalTokens: 40_000 } })}\n`);
+		emit("thinking", 60_000, "toolUse");
+		emit("still thinking", 60_000, "toolUse");
+		await new Promise((r) => setTimeout(r, 800));
+		emit("multiround done", 60_000);
+		trace("end-multiround");
+		process.exit(0);
+	}
 	const deps = /<untrusted_workflow_evidence>\n([\s\S]*?)\n<\/untrusted_workflow_evidence>/.exec(prompt)?.[1] ?? "no-deps";
 	emit(`${taskId} ok deps=${deps.slice(0, 400)}`, prompt.includes("BEHAVIOR=big") ? 200_000 : 100);
 	trace("end-ok");
@@ -221,6 +237,47 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("deadline is per task", /exceeded its 30s deadline/.test(result.text), result.text.split("\n").find((l) => l.includes("gap")) ?? "");
 	record("deadline fired near 30s", elapsed > 28_000 && elapsed < 45_000, `${Math.round(elapsed / 1_000)}s`);
 	record("healthy sibling produced evidence", /ok1 ok/.test(result.text), "");
+}
+
+// 8 - Escaped report stays inside its budget (audit finding #9).
+{
+	const result = await run({
+		objective: "hostile",
+		phases: [{ name: "p", tasks: [task("h1", "hostile"), task("h2", "hostile")] }],
+	});
+	record("hostile report run completes", result.ok, result.text.slice(0, 160));
+	record("escaped report respects the 48000 cap", result.text.length < 60_000, `report chars=${result.text.length}`);
+	record("hostile answers were trimmed", /"trimmed":true/.test(result.text), "");
+}
+
+// 9 - Mid-flight tokens of a multi-round task are visible to the budget (finding #5).
+{
+	const result = await run({
+		objective: "multiround",
+		maxTotalTokens: 100_000,
+		// Siblings are slow on purpose: m4/m5 must only be considered for dispatch
+		// after m1's usage events have landed, or this assertion races the scheduler.
+		phases: [{ name: "p", tasks: [task("m1", "multiround"), task("m2", "slow"), task("m3", "slow"), task("m4", "ok"), task("m5", "ok")] }],
+	});
+	record("multiround run returns", result.ok, result.text.slice(0, 160));
+	const started = trace().filter((e) => e.event === "start").map((e) => e.taskId);
+	record("in-flight tokens gate further dispatch", started.length < 5, `started=${started.join(",")}`);
+	record("multiround tokens are counted", /tokens=1[0-9]{5}/.test(result.text), result.text.split("\n")[1] ?? "");
+}
+
+// 10 - Evidence nobody consumed is reported as unused (finding #7).
+{
+	const result = await run({
+		objective: "unused",
+		phases: [
+			{ name: "scout", tasks: [task("a1", "ok"), task("a2", "ok")] },
+			// b depends on a1 only, so a2's evidence reaches neither a prompt nor the report.
+			{ name: "narrow", tasks: [{ id: "b", prompt: "BEHAVIOR=ok", dependsOn: ["a1"] }] },
+		],
+	});
+	record("partial-dependency run returns", result.ok, result.text.slice(0, 160));
+	record("orphaned evidence is flagged", /unused evidence \(1\).*a2/.test(result.text), result.text.split("\n").find((l) => l.includes("unused")) ?? "(no unused line)");
+	record("consumed evidence is not flagged", !/unused evidence.*a1/.test(result.text), "");
 }
 
 const failed = results.filter((r) => !r.pass);

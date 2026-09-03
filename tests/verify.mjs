@@ -158,6 +158,34 @@ const guardCases = [
 	["absolute outside path blocked", "bash", { command: "wc -l /etc/hosts" }, true, true],
 	["sed inplace blocked", "bash", { command: "sed -i s/a/b/ src/a.ts" }, true, true],
 	["powershell without grant", "powershell", { command: "ls" }, false, true],
+	// --- codex audit findings, all previously ALLOWED ---
+	["#1 file:// URL blocked", "read", { path: "file:///etc/passwd" }, false, true],
+	["#1 @file:// URL blocked", "read", { path: "@file:///etc/passwd" }, false, true],
+	["#1 file:// to secret blocked", "read", { path: `file://${PROJ}/.env` }, false, true],
+	// Pi replaces U+00A0 with a plain space and never trims, so ".env\u00A0" can only
+	// ever name a *different* file. Allowing it is correct; what matters is that the
+	// guard and Pi agree on the resolved name.
+	["#1 unicode-space path is not a bypass", "read", { path: ".env\u00A0" }, false, false],
+	["#2 glob shorthand blocked", "bash", { command: "head .e??" }, true, true],
+	["#2 glob star blocked", "bash", { command: "head *.pem" }, true, true],
+	["#2 bracket glob blocked", "bash", { command: "head [a-z].pem" }, true, true],
+	["#2 git rev secret path blocked", "bash", { command: "git show HEAD:.env" }, true, true],
+	["#2 git rev nested secret blocked", "bash", { command: "git show HEAD:config/id_rsa" }, true, true],
+	["#2 git rev normal path allowed", "bash", { command: "git show HEAD:src/a.ts" }, true, false],
+	["#3 npm publish blocked", "bash", { command: "npm publish" }, true, true],
+	["#3 npm install blocked", "bash", { command: "npm install left-pad" }, true, true],
+	["#3 cargo install blocked", "bash", { command: "cargo install ripgrep" }, true, true],
+	["#3 npm run still allowed", "bash", { command: "npm run test" }, true, false],
+	["#3 cargo test still allowed", "bash", { command: "cargo test" }, true, false],
+	["#3 git branch blocked", "bash", { command: "git branch audit-write" }, true, true],
+	["#3 git tag blocked", "bash", { command: "git tag v9" }, true, true],
+	["#4 flag value path escape blocked", "bash", { command: "git diff --output=/tmp/x" }, true, true],
+	["#4 clustered flag path blocked", "bash", { command: "make -f/etc/passwd" }, true, true],
+	["#4 loader flag blocked", "bash", { command: "node --experimental-loader=/tmp/x.mjs app.js" }, true, true],
+	["#4 rg --pre blocked", "bash", { command: "rg --pre touch pattern" }, true, true],
+	["#4 pytest --pyargs blocked", "bash", { command: "pytest --pyargs requests" }, true, true],
+	["#4 output flag blocked", "bash", { command: "git diff --output=out.txt" }, true, true],
+	["#4 in-workspace makefile allowed", "bash", { command: "make -f Makefile.dev" }, true, false],
 	["symlink escaping workspace blocked", "read", { path: "escape/hosts" }, false, true],
 	["symlink dir escaping workspace blocked", "grep", { pattern: "root", path: "escape" }, false, true],
 	["internal symlink still allowed", "read", { path: "src-link/a.ts" }, false, false],
@@ -196,9 +224,13 @@ for (const [label, toolName, input, shellEnv, expectBlocked] of guardCases) {
 
 // ---------- 4. Path canonicalization is applied in place ----------
 delete process.env.PI_ULTRA_WORKFLOW_SHELL;
+const realProj = realpathSync.native(PROJ);
 const mutable = { path: "src/a.ts" };
 handler({ toolName: "read", input: mutable }, { cwd: PROJ });
-record("guard leaves a valid relative path usable", typeof mutable.path === "string", mutable.path);
+record("guard rewrites the path to a canonical absolute path", mutable.path === join(realProj, "src", "a.ts"), mutable.path);
+const viaLink = { path: "src-link/a.ts" };
+handler({ toolName: "read", input: viaLink }, { cwd: PROJ });
+record("guard hands Pi the symlink-resolved path", viaLink.path === join(realProj, "src", "a.ts"), viaLink.path);
 
 // ---------- Report ----------
 const failed = results.filter((r) => !r.pass);

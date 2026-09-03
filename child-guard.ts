@@ -1,19 +1,23 @@
-import { homedir } from "node:os";
 import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
  * Boundary for Workflow child agents. This is a guard against accidents and
- * prompt injection in repository content, not a sandbox: the child runs as the
- * same user. Pi's `--tools` allowlist is the first line; this hook is the second.
+ * against prompt injection in repository content, not a sandbox: the child runs
+ * as the same user. Pi's `--tools` allowlist is the first line; this is the second.
+ *
+ * The rule that makes it work: every accepted path is rewritten in place as a
+ * canonical absolute path. Pi's own resolver is idempotent on those, so what Pi
+ * opens is exactly what passed the check here.
  */
 
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
-// `.git` is here for its config remote URLs, which can carry tokens. Only paths
-// pointing into it are refused; a plain grep of the repository root still works,
-// which is what the removed directory pre-scan used to break.
+// `.git` is listed for its config remote URLs, which can carry tokens. Only paths
+// pointing into it are refused; a plain grep of the repository root still works.
 const SECRET_SEGMENTS = new Set([".git", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".pi", ".codex"]);
 const SECRET_FILES = new Set([
 	".envrc", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
@@ -23,18 +27,29 @@ const SECRET_FILES = new Set([
 const SAFE_ENV_FILES = new Set([".env.example", ".env.sample", ".env.template"]);
 const CREDENTIAL_PATTERN = /\b(api[_-]?keys?|secrets?|passwords?|passwd|tokens?|credentials?|private[_-]?keys?|bearer)\b/i;
 
-// Compound commands, command substitution, redirection and escapes are refused
-// outright; that single rule removes most of the ways an allowlist gets bypassed.
-const SHELL_METACHARACTERS = /[;&|`$(){}<>\n\r\\]/;
+// Mirrors Pi's own normalisation (dist/utils/paths.js): the guard has to see the
+// same path Pi will open, or the check means nothing.
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+// Compound commands, substitution, redirection, escapes — and globs, whose
+// expansion happens after this check and would smuggle protected filenames past
+// the secret-name test. Children already have grep/find/ls for pattern matching.
+const SHELL_METACHARACTERS = /[;&|`$(){}<>\n\r\\*?[\]]/;
 const ALLOWED_COMMANDS = new Set([
 	"git", "rg", "ls", "wc", "head", "tail", "nl", "stat", "diff",
 	"pytest", "python3", "python", "node", "cargo", "npm", "make", "jq",
 ]);
-const GIT_READONLY = new Set(["blame", "branch", "describe", "diff", "log", "ls-files", "rev-parse", "shortlog", "show", "status", "tag"]);
-// The line to hold: a child may run code that lives in the workspace, never code
-// named on the command line (-c, -e) and never code from outside it (-m, -p,
-// --require, --exec-path). `=value` and aggregated short forms are covered too.
-const BANNED_FLAGS = /^--?(c|e|m|p|exec|execdir|delete|ok|eval|module|require|import|plugin|exec-path|inplace|in-place)(=|$)/;
+// `branch` and `tag` are writers despite reading like queries.
+const GIT_READONLY = new Set(["blame", "describe", "diff", "log", "ls-files", "rev-parse", "shortlog", "show", "status"]);
+// Commands whose first argument decides whether anything is installed, published
+// or executed. Anything not listed here is refused.
+const SUBCOMMAND_ALLOWLIST: Record<string, Set<string>> = {
+	npm: new Set(["run", "test", "ls", "view", "outdated"]),
+	cargo: new Set(["build", "check", "clippy", "run", "test", "tree", "metadata"]),
+};
+// Flags that name code or a destination rather than an input: they either execute
+// something outside the workspace or write outside it.
+const BANNED_FLAGS = /^--?(c|e|m|p|exec|execdir|delete|ok|eval|module|require|import|plugin|exec-path|inplace|in-place|pre|pyargs|loader|experimental-loader|experimental-import|output|output-dir|out-dir|out-file)(=|$)/;
 const AGGREGATED_SHORT_FLAGS = /^-[a-z]{2,}$/i;
 
 function isSecretName(name: string): boolean {
@@ -44,43 +59,79 @@ function isSecretName(name: string): boolean {
 	return lower === ".env" || (lower.startsWith(".env.") && !SAFE_ENV_FILES.has(lower));
 }
 
-function checkPath(rawPath: string, root: string): string | undefined {
-	let candidate = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
-	if (candidate === "~" || candidate.startsWith(`~${sep}`)) candidate = join(homedir(), candidate.slice(1));
-	let target = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
+/** Apply exactly the transforms Pi applies before it opens a path. */
+function normalizeLikePi(rawPath: string): string {
+	let candidate = rawPath.replace(UNICODE_SPACES, " ");
+	if (candidate.startsWith("@")) candidate = candidate.slice(1);
+	if (candidate === "~") return homedir();
+	if (candidate.startsWith(`~${sep}`)) return join(homedir(), candidate.slice(2));
+	if (/^file:\/\//i.test(candidate)) {
+		try {
+			return fileURLToPath(candidate);
+		} catch {
+			return candidate;
+		}
+	}
+	return candidate;
+}
+
+function checkPath(rawPath: string, root: string): { problem?: string; target: string } {
+	const normalized = normalizeLikePi(rawPath);
+	let target = isAbsolute(normalized) ? resolve(normalized) : resolve(root, normalized);
 	// Resolve symlinks: a link that lives in the workspace must not be a way out of it.
 	try {
 		target = realpathSync.native(target);
 	} catch {
-		// The path does not exist yet; the lexical form is all there is to check.
+		// The path does not exist yet; its lexical form is all there is to check.
 	}
 	const rel = relative(root, target);
-	if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) return `path leaves the workspace: ${rawPath}`;
-	if (rel.split(sep).some(isSecretName)) return `path is protected: ${rawPath}`;
-	return undefined;
+	if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
+		return { problem: `path leaves the workspace: ${rawPath}`, target };
+	}
+	if (rel.split(sep).some(isSecretName)) return { problem: `path is protected: ${rawPath}`, target };
+	return { target };
+}
+
+/** The value carried by `--flag=value` or a clustered `-fvalue`. */
+function flagValue(token: string): string | undefined {
+	const equals = token.indexOf("=");
+	if (equals > 0) return token.slice(equals + 1);
+	const clustered = /^-[A-Za-z](.+)$/.exec(token);
+	return clustered?.[1];
 }
 
 function checkCommand(command: string, root: string): string | undefined {
 	const trimmed = command.trim();
 	if (!trimmed) return "empty command";
 	if (SHELL_METACHARACTERS.test(trimmed)) {
-		return "compound commands, substitution, redirection and escapes are not allowed; run one plain command";
+		return "compound commands, substitution, redirection, escapes and globs are not allowed; run one plain command";
 	}
-	const tokens = trimmed.split(/\s+/);
-	const [head, ...rest] = tokens;
+	const [head, ...rest] = trimmed.split(/\s+/);
 	if (!ALLOWED_COMMANDS.has(head)) {
 		return `"${head}" is not in the read-only command allowlist (${[...ALLOWED_COMMANDS].sort().join(", ")})`;
 	}
 	if (head === "git" && !GIT_READONLY.has(rest[0] ?? "")) {
 		return `git must start with a read-only subcommand (${[...GIT_READONLY].join(", ")})`;
 	}
+	const subcommands = SUBCOMMAND_ALLOWLIST[head];
+	if (subcommands && !subcommands.has(rest[0] ?? "")) {
+		return `${head} subcommand must be one of ${[...subcommands].join(", ")}`;
+	}
 	for (const token of rest) {
-		if (BANNED_FLAGS.test(token)) return `flag "${token}" can execute code from outside the workspace`;
+		if (BANNED_FLAGS.test(token)) return `flag "${token}" runs or writes code outside the workspace`;
 		if (AGGREGATED_SHORT_FLAGS.test(token) && /[cemp]/i.test(token)) return `aggregated flag "${token}" may execute code`;
-		if (token.startsWith("-")) continue;
-		if (token.includes("..")) return `path traversal in "${token}"`;
-		if (token.includes("/") || token.startsWith(".")) {
-			const problem = checkPath(token.replace(/^["']|["']$/g, ""), root);
+		// A revision spec such as `HEAD:.env` reads a protected file out of history.
+		const colon = token.indexOf(":");
+		if (colon >= 0 && !token.startsWith("-")) {
+			const revisionPath = token.slice(colon + 1);
+			if (revisionPath.split("/").some(isSecretName)) return `revision path is protected: ${token}`;
+		}
+		// Options carry paths too, so their values get the same treatment.
+		const candidate = token.startsWith("-") ? flagValue(token) : token;
+		if (candidate === undefined) continue;
+		if (candidate.includes("..")) return `path traversal in "${token}"`;
+		if (candidate.includes("/") || candidate.startsWith(".") || isAbsolute(candidate)) {
+			const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root);
 			if (problem) return problem;
 		}
 	}
@@ -117,7 +168,11 @@ export default function childGuard(pi: ExtensionAPI): void {
 		// `grep`, `find` and `ls` default to the workspace root when path is absent.
 		if (input.path === undefined) return undefined;
 		if (typeof input.path !== "string") return { block: true, reason: "Tool path must be a string." };
-		const problem = checkPath(input.path, root);
-		return problem ? { block: true, reason: problem } : undefined;
+		const { problem, target } = checkPath(input.path, root);
+		if (problem) return { block: true, reason: problem };
+		// Hand Pi the canonical path that just passed, so no later normalisation
+		// step can turn it into a different file.
+		input.path = target;
+		return undefined;
 	});
 }

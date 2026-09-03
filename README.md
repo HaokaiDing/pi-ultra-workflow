@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-600 lines for the scheduler, 111 for the child boundary. It deliberately has no background mode, no locks and
+642 lines for the scheduler, 178 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -50,7 +50,8 @@ The main agent calls one tool:
 
 - Phases run in order; tasks inside a phase run concurrently, at most 3 at once.
 - A task's `dependsOn` defaults to every task in the previous phase. Fan-in is not width-limited.
-- The last phase of a multi-phase run gets `max` effort plus Fast. Everything else gets `high`.
+- The last phase of a multi-phase run defaults to `max` effort plus Fast; everything else defaults to `high`.
+  An explicit per-task `effort` overrides the default.
 - `shell: true` grants read-only shell access to that task. Off by default.
 - The call blocks until the run finishes and returns one report. Cancel by interrupting the tool call.
 - A per-run journal lands in `~/.pi/agent/ultra-workflow/runs/<run-id>.json`.
@@ -63,15 +64,24 @@ Children get `read`, `grep`, `find`, `ls` — and `bash` only when the task asks
 
 - paths must resolve inside the workspace, and never into `.git`, `.ssh`, `.env`, `*.pem`, `auth.json` and friends
 - `grep` patterns that hunt for credentials are refused
-- shell commands must be one plain command: no `;`, `&&`, `|`, `` ` ``, `$(...)`, redirection or escapes
-- the command must start with one of `git rg ls wc head tail nl stat diff pytest python3 python node cargo npm make jq`,
-  and `git` only with a read-only subcommand
-- flags that run code from outside the workspace (`-c`, `-e`, `-m`, `-p`, `--require`, `--exec-path`, aggregated
-  short forms) are refused
+- shell commands must be one plain command: no `;`, `&&`, `|`, `` ` ``, `$(...)`, redirection, escapes or globs
+  (glob expansion happens after the check, so `head *.pem` would smuggle a protected name past it)
+- the command must start with one of `git rg ls wc head tail nl stat diff pytest python3 python node cargo npm make jq`
+- `git` only with a read-only subcommand — `branch` and `tag` are excluded because they write refs
+- `npm` and `cargo` only with a listed subcommand, so `npm publish`, `npm install` and `cargo install` are refused
+- a `git` revision spec may not point at a protected file (`git show HEAD:.env`)
+- flags that run or write code outside the workspace are refused (`-c`, `-e`, `-m`, `-p`, `--require`,
+  `--exec-path`, `--pre`, `--pyargs`, `--loader`, `--output`, aggregated short forms), and the **value** of a
+  flag gets the same path check as a bare argument (`--output=/tmp/x`, `-f/etc/passwd`)
+
+Every accepted path is rewritten in place as a canonical absolute path — resolving `~`, `@`, `file://` URLs,
+Unicode spaces and symlinks first. Pi's own resolver is idempotent on such a path, so the file Pi opens is
+exactly the one that passed the check.
 
 **This is a guard against accidents and against injection from repository content. It is not a sandbox** —
 children run as the same user, and they are allowed to run the project's own scripts (`npm run`, `make`,
-`python3 script.py`), which is the whole point of `shell: true`.
+`python3 script.py`), which is the whole point of `shell: true`. Treat `shell: true` on a repository you do
+not trust as running that repository's code.
 
 ## Design trade-offs
 
@@ -104,14 +114,16 @@ Behavioural choices worth knowing:
 3. The shell allowlist is not a sandbox (see above).
 4. Long runs occupy the Pi session, since the call is synchronous.
 5. `MODEL` is a constant. Multi-model runs need an edit.
+6. macOS and Linux only. Process-group kills, `detached` spawning and the path checks are POSIX-shaped, so the
+   tool refuses to start on Windows rather than pretending to enforce its boundary there.
 
 ## Tests
 
 No dependencies, no network, no API calls.
 
 ```bash
-node tests/verify.mjs          # 77 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 28 checks: real spawns via a stub child (~45s, includes a 30s deadline)
+node tests/verify.mjs          # 106 checks: loading, tool contract, planner, guard boundaries
+node tests/harness/cli.js      # 37 checks: real spawns via a stub child (~50s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only
