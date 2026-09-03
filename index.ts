@@ -30,9 +30,11 @@ Never read or reproduce credentials, private keys, auth files or environment fil
 Put the conclusion and any falsifying evidence first. Cite exact paths and line numbers.
 Separate fact from inference and state what would change your answer.`;
 
-const SHELL_NOTE = `You also have read-only shell access: one plain command at a time, no pipes, no substitution, no redirection.
+const SHELL_NOTE = `You also have read-only shell access: one plain command at a time, with no pipes, substitution, redirection or globs.
 Allowed: git log/diff/status/show/blame, rg, wc, head, tail, nl, stat, diff, pytest, and the project's own scripts via python3/node/cargo/npm/make.
-Flags that run code from outside the workspace (-c, -e, -m, -p, --require) are refused; put throwaway code in a file under the workspace instead.
+Ordinary flags work, including git log -p, head -c and pytest -m. Refused are the ones that make an interpreter
+run code you name on the command line (python -c/-m, node -e/--require, pytest -p) and anything writing outside the workspace.
+Put throwaway code in a file under the workspace instead, then run that file.
 Prefer running the project's own checks over reasoning about what they would print.`;
 
 const TaskSchema = Type.Object({

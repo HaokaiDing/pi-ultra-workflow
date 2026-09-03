@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-642 lines for the scheduler, 178 for the child boundary. It deliberately has no background mode, no locks and
+644 lines for the scheduler, 208 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -70,9 +70,13 @@ Children get `read`, `grep`, `find`, `ls` — and `bash` only when the task asks
 - `git` only with a read-only subcommand — `branch` and `tag` are excluded because they write refs
 - `npm` and `cargo` only with a listed subcommand, so `npm publish`, `npm install` and `cargo install` are refused
 - a `git` revision spec may not point at a protected file (`git show HEAD:.env`)
-- flags that run or write code outside the workspace are refused (`-c`, `-e`, `-m`, `-p`, `--require`,
-  `--exec-path`, `--pre`, `--pyargs`, `--loader`, `--output`, aggregated short forms), and the **value** of a
-  flag gets the same path check as a bare argument (`--output=/tmp/x`, `-f/etc/passwd`)
+- flag policy is per command, because the same letter means different things: `python -c` runs code but
+  `head -c` counts bytes, `python -m` names a module but `pytest -m` selects a marker, `pytest -p` loads a
+  plugin but `git log -p` shows a patch. Refused are the ones that make an interpreter run code named on the
+  command line (`python -c/-m`, `node -e/-r/--loader`, `pytest -p/--pyargs`, `rg --pre`, `git --exec-path`,
+  `make --eval`) plus clustered short forms hiding those letters
+- destination flags (`--output`, `--out-file`, …) are refused outright, and the **value** of any flag gets the
+  same path check as a bare argument (`--output=/tmp/x`, `-f/etc/passwd`)
 
 Every accepted path is rewritten in place as a canonical absolute path — resolving `~`, `@`, `file://` URLs,
 Unicode spaces and symlinks first. Pi's own resolver is idempotent on such a path, so the file Pi opens is
@@ -114,7 +118,9 @@ Behavioural choices worth knowing:
 3. The shell allowlist is not a sandbox (see above).
 4. Long runs occupy the Pi session, since the call is synchronous.
 5. `MODEL` is a constant. Multi-model runs need an edit.
-6. macOS and Linux only. Process-group kills, `detached` spawning and the path checks are POSIX-shaped, so the
+6. `git log -p` and `git show` print the contents of files as they exist in history, including ones the
+   secret-name rules protect. Do not commit credentials; the guard cannot un-commit them.
+7. macOS and Linux only. Process-group kills, `detached` spawning and the path checks are POSIX-shaped, so the
    tool refuses to start on Windows rather than pretending to enforce its boundary there.
 
 ## Tests
@@ -122,7 +128,7 @@ Behavioural choices worth knowing:
 No dependencies, no network, no API calls.
 
 ```bash
-node tests/verify.mjs          # 106 checks: loading, tool contract, planner, guard boundaries
+node tests/verify.mjs          # 123 checks: loading, tool contract, planner, guard boundaries
 node tests/harness/cli.js      # 37 checks: real spawns via a stub child (~50s, includes a 30s deadline)
 ```
 

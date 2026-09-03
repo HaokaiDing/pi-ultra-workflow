@@ -44,13 +44,38 @@ const GIT_READONLY = new Set(["blame", "describe", "diff", "log", "ls-files", "r
 // Commands whose first argument decides whether anything is installed, published
 // or executed. Anything not listed here is refused.
 const SUBCOMMAND_ALLOWLIST: Record<string, Set<string>> = {
-	npm: new Set(["run", "test", "ls", "view", "outdated"]),
+	// `view` and `outdated` query the registry, which would hand a child the network
+	// access Pi otherwise denies it. Build and test commands may still fetch
+	// dependencies — that is inherent to running the project's own tooling.
+	npm: new Set(["run", "test", "ls"]),
 	cargo: new Set(["build", "check", "clippy", "run", "test", "tree", "metadata"]),
 };
-// Flags that name code or a destination rather than an input: they either execute
-// something outside the workspace or write outside it.
-const BANNED_FLAGS = /^--?(c|e|m|p|exec|execdir|delete|ok|eval|module|require|import|plugin|exec-path|inplace|in-place|pre|pyargs|loader|experimental-loader|experimental-import|output|output-dir|out-dir|out-file)(=|$)/;
-const AGGREGATED_SHORT_FLAGS = /^-[a-z]{2,}$/i;
+
+// Destination flags, dangerous whatever the command.
+const BANNED_FLAGS = /^--(output|output-dir|out-dir|out-file)(=|$)/;
+
+// Everything else is per-command: `-c` executes code for python but counts bytes
+// for head, `-m` selects a module for python but a marker for pytest, `-p` loads a
+// plugin for pytest but shows a patch for git. A single global blocklist would
+// either miss the dangerous ones or break the ordinary ones.
+const COMMAND_BANNED_FLAGS: Record<string, RegExp> = {
+	python: /^-[cm]$|^--(command|module)(=|$)/,
+	python3: /^-[cm]$|^--(command|module)(=|$)/,
+	node: /^-[epr]$|^--(eval|print|require|import|loader|experimental-loader|experimental-import|experimental-network-imports)(=|$)/,
+	pytest: /^-p$|^--(plugin|pyargs)(=|$)/,
+	rg: /^--(pre|pre-glob|hostname-bin)(=|$)/,
+	git: /^--exec-path(=|$)/,
+	make: /^--eval(=|$)/,
+};
+// Clustered short flags can hide a dangerous letter, but only for the commands
+// where those letters mean "execute".
+const CLUSTERED_RISK: Record<string, RegExp> = {
+	python: /[cm]/,
+	python3: /[cm]/,
+	node: /[epr]/,
+	pytest: /p/,
+};
+const CLUSTERED_SHORT_FLAG = /^-[a-z]{2,}$/i;
 
 function isSecretName(name: string): boolean {
 	const lower = name.toLowerCase();
@@ -117,9 +142,14 @@ function checkCommand(command: string, root: string): string | undefined {
 	if (subcommands && !subcommands.has(rest[0] ?? "")) {
 		return `${head} subcommand must be one of ${[...subcommands].join(", ")}`;
 	}
+	const commandFlags = COMMAND_BANNED_FLAGS[head];
+	const clusteredRisk = CLUSTERED_RISK[head];
 	for (const token of rest) {
-		if (BANNED_FLAGS.test(token)) return `flag "${token}" runs or writes code outside the workspace`;
-		if (AGGREGATED_SHORT_FLAGS.test(token) && /[cemp]/i.test(token)) return `aggregated flag "${token}" may execute code`;
+		if (BANNED_FLAGS.test(token)) return `flag "${token}" writes outside the workspace`;
+		if (commandFlags?.test(token)) return `flag "${token}" makes ${head} run code from outside the workspace`;
+		if (clusteredRisk && CLUSTERED_SHORT_FLAG.test(token) && clusteredRisk.test(token.slice(1))) {
+			return `clustered flag "${token}" may make ${head} execute code`;
+		}
 		// A revision spec such as `HEAD:.env` reads a protected file out of history.
 		const colon = token.indexOf(":");
 		if (colon >= 0 && !token.startsWith("-")) {
