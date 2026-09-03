@@ -37,6 +37,8 @@ writeFileSync(join(PROJ, "package.json"), "{}\n");
 writeFileSync(join(PROJ, "src", "a.ts"), "export const a = 1;\n");
 writeFileSync(join(PROJ, ".env"), "SECRET=1\n");
 writeFileSync(join(PROJ, "secrets.pem"), "x\n");
+writeFileSync(join(PROJ, ".env.example"), "SECRET=\n");
+writeFileSync(join(PROJ, "scripts", "check.js"), "console.log(1)\n");
 writeFileSync(join(PROJ, "scripts", "check.py"), "print(1)\n");
 
 // A directory with no project marker anywhere above it inside the temp root.
@@ -178,8 +180,10 @@ record("guard registers a tool_call handler", typeof handler === "function", typ
 const guardCases = [
 	// [label, toolName, input, shellEnv, expectBlocked]
 	["read inside workspace", "read", { path: "src/a.ts" }, false, false],
-	["grep with default path", "grep", { pattern: "foo" }, false, false],
-	["grep in subdir", "grep", { pattern: "foo", path: "src" }, false, false],
+	["grep without a path blocked", "grep", { pattern: "foo" }, false, true],
+	["grep on a directory blocked", "grep", { pattern: "foo", path: "src" }, false, true],
+	["grep on a single file allowed", "grep", { pattern: "foo", path: "src/a.ts" }, false, false],
+	["grep on a protected file still blocked", "grep", { pattern: "foo", path: ".env" }, false, true],
 	["ls workspace root", "ls", { path: "." }, false, false],
 	["read escaping workspace", "read", { path: "../outside" }, false, true],
 	["read ssh key via tilde", "read", { path: "~/.ssh/id_rsa" }, false, true],
@@ -224,12 +228,12 @@ const guardCases = [
 	["#1 file:// URL blocked", "read", { path: "file:///etc/passwd" }, false, true],
 	["#1 @file:// URL blocked", "read", { path: "@file:///etc/passwd" }, false, true],
 	["#1 file:// to secret blocked", "read", { path: `file://${PROJ}/.env` }, false, true],
-	// Pi replaces U+00A0 with a plain space and never trims, so ".env\u00A0" can only
-	// ever name a *different* file. Allowing it is correct; what matters is that the
-	// guard and Pi agree on the resolved name.
-	["#1 unicode-space path is not a bypass", "read", { path: ".env\u00A0" }, false, false],
+	// ".env\u00A0" names a different, non-existent file, and an unresolvable path is
+	// now refused outright — either way it is not a route to ".env".
+	["#1 unicode-space path is not a bypass", "read", { path: ".env\u00A0" }, false, true],
 	["#2 glob shorthand blocked", "bash", { command: "head .e??" }, true, true],
 	["#2 glob star blocked", "bash", { command: "head *.pem" }, true, true],
+	["unresolvable file path blocked for read", "read", { path: "does/not/exist.ts" }, false, true],
 	["#2 bracket glob blocked", "bash", { command: "head [a-z].pem" }, true, true],
 	["#2 git rev secret path blocked", "bash", { command: "git show HEAD:.env" }, true, true],
 	["#2 git rev nested secret blocked", "bash", { command: "git show HEAD:config/id_rsa" }, true, true],

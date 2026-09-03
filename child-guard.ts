@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,14 +100,24 @@ function normalizeLikePi(rawPath: string): string {
 	return candidate;
 }
 
-function checkPath(rawPath: string, root: string): { problem?: string; target: string } {
+/**
+ * `requireResolve` separates the two callers. A file tool's path is about to be
+ * opened by Pi, which retries NFD and curly-quote variants, so a name that does
+ * not resolve must be refused outright. A shell argument is different: plenty of
+ * legitimate ones never exist on disk — a git revision spec, an output file, a
+ * directory pytest will create — so there the lexical containment check stands.
+ */
+function checkPath(rawPath: string, root: string, requireResolve: boolean): { problem?: string; target: string } {
 	const normalized = normalizeLikePi(rawPath);
 	let target = isAbsolute(normalized) ? resolve(normalized) : resolve(root, normalized);
-	// Resolve symlinks: a link that lives in the workspace must not be a way out of it.
+	// Resolve symlinks: a link that lives in the workspace must not be a way out of
+	// it. A path that does not resolve is refused rather than checked lexically —
+	// Pi's read tool retries NFD and curly-quote variants, so an unresolved name can
+	// still open a different, existing file that this check never saw.
 	try {
 		target = realpathSync.native(target);
 	} catch {
-		// The path does not exist yet; its lexical form is all there is to check.
+		if (requireResolve) return { problem: `path does not resolve: ${rawPath}`, target };
 	}
 	const rel = relative(root, target);
 	if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
@@ -161,7 +171,7 @@ function checkCommand(command: string, root: string): string | undefined {
 		if (candidate === undefined) continue;
 		if (candidate.includes("..")) return `path traversal in "${token}"`;
 		if (candidate.includes("/") || candidate.startsWith(".") || isAbsolute(candidate)) {
-			const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root);
+			const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root, false);
 			if (problem) return problem;
 		}
 	}
@@ -195,11 +205,29 @@ export default function childGuard(pi: ExtensionAPI): void {
 		if (event.toolName === "grep" && typeof input.pattern === "string" && CREDENTIAL_PATTERN.test(input.pattern)) {
 			return { block: true, reason: "Searching for credentials is not allowed." };
 		}
-		// `grep`, `find` and `ls` default to the workspace root when path is absent.
-		if (input.path === undefined) return undefined;
+		// `grep` searches recursively, so checking only the search root would let a
+		// generic pattern return the contents of a protected descendant. Its scope is
+		// therefore restricted to a single file. `find` and `ls` list names without
+		// reading contents, so they may still default to the workspace root.
+		if (input.path === undefined) {
+			return event.toolName === "grep"
+				? { block: true, reason: "grep must name a single file; use find to locate candidates first." }
+				: undefined;
+		}
 		if (typeof input.path !== "string") return { block: true, reason: "Tool path must be a string." };
-		const { problem, target } = checkPath(input.path, root);
+		const { problem, target } = checkPath(input.path, root, true);
 		if (problem) return { block: true, reason: problem };
+		if (event.toolName === "grep") {
+			let directory = false;
+			try {
+				directory = statSync(target).isDirectory();
+			} catch {
+				return { block: true, reason: `grep target does not resolve: ${input.path}` };
+			}
+			if (directory) {
+				return { block: true, reason: "grep must name a single file, since a directory search would read protected files under it; use find to locate candidates first." };
+			}
+		}
 		// Hand Pi the canonical path that just passed, so no later normalisation
 		// step can turn it into a different file.
 		input.path = target;

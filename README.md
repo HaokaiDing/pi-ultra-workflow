@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-763 lines for the scheduler, 208 for the child boundary. It deliberately has no background mode, no locks and
+806 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -77,6 +77,10 @@ anything without a marker, where an empty `.pi-workflow-root` file opts it in.
 Children get `read`, `grep`, `find`, `ls` — and `bash` only when the task asks for it. `child-guard.ts` enforces:
 
 - paths must resolve inside the workspace, and never into `.git`, `.ssh`, `.env`, `*.pem`, `auth.json` and friends
+- `grep` must name a single file: it searches recursively, so a directory scope would return the contents
+  of protected files under it. Use `find` to locate candidates first
+- a path that does not resolve is refused for the file tools, since Pi retries NFD and curly-quote variants and
+  an unresolved name can still open a different, existing file
 - `grep` patterns that hunt for credentials are refused
 - shell commands must be one plain command: no `;`, `&&`, `|`, `` ` ``, `$(...)`, redirection, escapes or globs
   (glob expansion happens after the check, so `head *.pem` would smuggle a protected name past it)
@@ -135,7 +139,9 @@ Behavioural choices worth knowing:
 
 1. `maxTotalTokens` is a dispatch gate, not a hard cap — concurrent workers all clear it before any of them
    has reported usage. `maxTokensPerTask` (default 80 000) is the enforceable one: a task that reaches it is cut
-   off and its partial answer kept. Worst case is roughly the per-task ceiling times the concurrency.
+   off and its partial answer kept. Worst case is roughly the per-task ceiling times the concurrency. Token
+   counts sum each response's `totalTokens`, which includes `cacheRead`, so a cached prefix is counted once per
+   request — the figure overstates billed cost and errs toward stopping early.
 2. Pi ships no web or fetch tool, so children cannot search the web. Literature and web work stays in the
    main agent.
 3. The shell policy is a coarse filter with known gaps, not a boundary you can lean on for untrusted code
@@ -152,8 +158,8 @@ Behavioural choices worth knowing:
 No dependencies, no network, no API calls.
 
 ```bash
-node tests/verify.mjs          # 132 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 63 checks: real spawns via a stub child (~70s, includes a 30s deadline)
+node tests/verify.mjs          # 135 checks: loading, tool contract, planner, guard boundaries
+node tests/harness/cli.js      # 68 checks: real spawns via a stub child (~80s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only

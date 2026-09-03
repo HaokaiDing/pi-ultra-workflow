@@ -328,6 +328,16 @@ function terminate(proc: ChildProcessWithoutNullStreams): void {
 	};
 	signalTree("SIGTERM");
 	setTimeout(() => {
+		// Not gated on the leader still being alive: once it exits, exitCode is set
+		// while descendants that ignored SIGTERM keep running. Signal the group.
+		if (proc.pid !== undefined && process.platform !== "win32") {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+				return;
+			} catch {
+				// The group is gone, or this platform refused it.
+			}
+		}
 		if (proc.exitCode === null && proc.signalCode === null) signalTree("SIGKILL");
 	}, 5_000).unref();
 }
@@ -376,10 +386,6 @@ async function runChild(
 		if (existsSync(fast)) args.push("--extension", fast);
 	}
 
-	// A floor for the budget before any usage event arrives: three large prompts
-	// dispatched together must not all slip under the ceiling.
-	inFlight.set(task.id, Math.ceil(prompt.length / 4));
-
 	const invocation = piInvocation(args);
 	const proc = spawn(invocation.command, invocation.args, {
 		cwd: run.cwd,
@@ -389,6 +395,10 @@ async function runChild(
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	children.add(proc);
+	// Reserve only once the child exists. Before this point `piInvocation` and
+	// `spawn` can throw synchronously, and that path never reaches `finish()`, so an
+	// early reservation would linger and be counted as real spend.
+	inFlight.set(task.id, Math.ceil(prompt.length / 4));
 
 	return await new Promise<ChildOutcome>((resolvePromise, rejectPromise) => {
 		const decoder = new StringDecoder("utf8");
@@ -437,18 +447,27 @@ async function runChild(
 			if (event?.type === "message_update") {
 				const live = event.usage?.totalTokens;
 				if (typeof live === "number" && Number.isFinite(live) && live > 0) {
-					inFlight.set(task.id, Math.max(inFlight.get(task.id) ?? 0, tokens, live));
+					inFlight.set(task.id, Math.max(inFlight.get(task.id) ?? 0, tokens + live));
+				}
+				// A single streaming response can pass the ceiling on its own, so check
+				// here too rather than waiting for the turn to end.
+				if (tokens + (live ?? 0) > run.maxTokensPerTask && !forced) {
+					budgetCut = true;
+					forced = new Error(`Task ${task.id} hit its ${run.maxTokensPerTask}-token budget.`);
+					terminate(proc);
 				}
 				return;
 			}
 			if (event?.type !== "message_end" || event.message?.role !== "assistant") return;
 			const body = assistantText(event.message);
 			if (body) text = body;
-			// `totalTokens` is cumulative within the child's session, not per turn, so
-			// summing it squares the count: a twenty-turn child reported ten times its
-			// real spend. Take the high-water mark instead.
+			// `usage.totalTokens` is per response — input + output + cacheRead + cacheWrite
+			// for that one request — so the turns have to be summed. It merely looks
+			// cumulative because cacheRead grows with the conversation. Summing counts a
+			// cached prefix once per request, which overstates cost relative to billing
+			// but errs toward stopping early, and that is the safe direction for a budget.
 			const turnTokens = event.message?.usage?.totalTokens;
-			if (typeof turnTokens === "number" && Number.isFinite(turnTokens)) tokens = Math.max(tokens, turnTokens);
+			if (typeof turnTokens === "number" && Number.isFinite(turnTokens)) tokens += turnTokens;
 			if (tokens > run.maxTokensPerTask && !forced) {
 				budgetCut = true;
 				forced = new Error(`Task ${task.id} hit its ${run.maxTokensPerTask}-token budget.`);
@@ -465,8 +484,11 @@ async function runChild(
 		};
 
 		proc.stdout.on("data", (chunk: Buffer) => {
+			// Nothing to accumulate once settled or already over the limit: a child with
+			// no newlines could otherwise keep growing the buffer until it is killed.
+			if (settled || forced) return;
 			bytes += chunk.length;
-			if (bytes > MAX_EVENT_BYTES && !forced) {
+			if (bytes > MAX_EVENT_BYTES) {
 				forced = new Error(`Task ${task.id} exceeded the ${MAX_EVENT_BYTES}-byte event stream limit.`);
 				terminate(proc);
 				return;
@@ -499,6 +521,7 @@ async function runChild(
 			}, 2_000).unref();
 		});
 		proc.on("close", (code, closeSignal) => {
+			if (settled) return;
 			buffer += decoder.end();
 			if (buffer.trim()) processLine(buffer);
 			if (forced) {
@@ -608,7 +631,7 @@ async function execute(run: Run, signal: AbortSignal, children: Set<ChildProcess
 			await runPhase(run, phase, done, signal, children, inFlight);
 			if (signal.aborted) break;
 			if (phase.tasks.every((task) => task.status === "failed")) {
-				run.stopReason = `Every task in phase "${phase.name}" failed; later phases were skipped.`;
+				run.stopReason = `Every task in phase ${safeJson(phase.name)} failed; later phases were skipped.`;
 				break;
 			}
 		}
@@ -625,8 +648,10 @@ async function execute(run: Run, signal: AbortSignal, children: Set<ChildProcess
 		throw new Error(`Workflow ${run.id} produced no evidence. Untrusted diagnostics: ${safeJson(reasons)}`);
 	}
 
-	const lastPhase = run.phases.filter((phase) => phase.tasks.some((task) => task.status !== "pending")).at(-1);
-	const answers = (lastPhase?.tasks ?? []).filter((task) => task.status === "completed");
+	// `completed.length > 0` above guarantees at least one phase has a non-pending
+	// task, so `lastPhase` is always defined here.
+	const lastPhase = run.phases.filter((phase) => phase.tasks.some((task) => task.status !== "pending")).at(-1) as { name: string; tasks: Task[] };
+	const answers = lastPhase.tasks.filter((task) => task.status === "completed");
 	const chosen = answers.length > 0 ? answers : completed;
 	// Keep the whole report bounded. The budget has to be measured *after* escaping:
 	// `safeJson` expands one `<` into six characters, so hostile content can inflate
@@ -634,7 +659,8 @@ async function execute(run: Run, signal: AbortSignal, children: Set<ChildProcess
 	// form actually fits; the 256-char floor makes this converge.
 	const buildReport = (limit: number) =>
 		chosen.map((task) => {
-			const body = task.result ?? "";
+			// Only completed tasks reach `chosen`, and completing always writes a result.
+			const body = task.result as string;
 			const kept = clip(body, limit);
 			const dropped = body.length - kept.length;
 			return {
