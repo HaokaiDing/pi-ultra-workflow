@@ -1,12 +1,12 @@
-# 审查任务书 · pi-ultra-workflow（第 4 轮）
+# 审查任务书 · pi-ultra-workflow（第 5 轮）
 
 给独立 reviewer 的自包含上下文。目标是找**当前代码里还没被发现的缺陷**。前三轮加上一轮自审共处置了 30 余条，都列在下面的排除项里。
 
 ## 范围
 
-`index.ts`（817 行）与 `child-guard.ts`（236 行），以及 `tests/` 里对它们的覆盖。**两个文件都在范围内** —— 上一轮刚各改了 5 处和 2 处。
+`index.ts`（842 行）与 `child-guard.ts`（236 行），以及 `tests/` 里对它们的覆盖。**两个文件都在范围内** —— 上一轮刚各改了 5 处和 2 处。
 
-只读审查。**禁止修改任何文件，禁止 commit，禁止运行真 `pi` 会话**（会消耗订阅额度）。`tests/verify.mjs`（135 项）与 `tests/harness/cli.js`（68 项）可以跑，它们不发 provider 请求。不要写 `.md` 文件，结论直接回复。
+只读审查。**禁止修改任何文件，禁止 commit，禁止运行真 `pi` 会话**（会消耗订阅额度）。`tests/verify.mjs`（135 项）与 `tests/harness/cli.js`（72 项）可以跑，它们不发 provider 请求。不要写 `.md` 文件，结论直接回复。
 
 ## 审查性质
 
@@ -27,6 +27,8 @@ Pi 的 extension，注册单个 `Workflow` tool。主 agent 传 phase 列表，�
 7. `MODEL` 硬编码。
 8. 任务数由调用方按 prompt 里的规模阶梯决定，代码只兜硬上限（`MAX_TASKS=8`、`CONCURRENCY=3`）。不做独立的规划 agent。
 9. token 计数把每个 response 的 `totalTokens`（含 `cacheRead`）逐轮求和。这**高估**了计费成本（缓存前缀每次请求都计一次），刻意偏向早停。
+11. **预算上限是防失控，不是省钱**。默认 per-task 250k token / 900 秒、全 run 1.5M。这些数字刻意定得宽：审 800 行代码约 4–6 万 token，深挖一个面可到十几万，压低上限只会让 worker 在写出结论前被切断。不要建议下调这些默认值，也不要把"消耗大"本身当缺陷报。
+12. 报告尺寸的约束轴不是成本而是**调用方的上下文窗口**：单 task 32k 字符、整份报告 80k（含 header）、fan-in 280k。完整答案留在日志里。
 10. shell 命令策略是**粗筛**，不是边界。已知放行大量选项组合，结论见 README known limitations。适合审自己的代码，不适用于不信任的代码。把它改成固定命令模板是独立的一轮工作 —— **本轮不要报 shell 命令白名单的覆盖面问题**，也不要重复那 22 条已记录的边界形式。
 
 ## 已知限制 —— 已承认，别重复报
@@ -47,7 +49,9 @@ Pi 的 extension，注册单个 `Workflow` tool。主 agent 传 phase 列表，�
 
 ## 请重点审这些
 
-1. **进程组升级的新时序**（`index.ts` 的 `terminate`）。现在是：SIGTERM → 挂一个 5 秒 timer → 在 `exit` 事件立即杀组 → 在 `close` 事件清掉 timer。理由是既要处理"leader 退出而后代忽略 SIGTERM"，又不能在 OS 可能复用 pid 之后还持有它。请找出这个时序仍会漏杀或误杀的情形，特别是 `exit` 与 `close` 的先后、以及 `escalate` 被调用两次的后果。
+0. **新预算数值下的最坏情况**。per-task 250k × 并发 3 = 单 phase 约 750k，4 phase 理论上界远超 run 的 1.5M；`maxTokensPerTask` 被 `Math.min(..., maxTotalTokens)` clamp。请算出真实的 token 与墙钟上界，指出这套数字有没有内部矛盾（例如 run 预算先撞、导致后面 phase 永不派发而报告仍宣称成功），以及 900 秒 × 4 phase 的串行等待是否需要一个总 deadline。
+
+1. **进程组升级的时序**（`index.ts` 的 `terminate`）。已经改过两轮：第一版只在 leader 存活时升级（漏杀忽略 SIGTERM 的后代），第二版无条件升级（把 pid 复用风险带回来），现在按调用时刻的 leader 状态分三路 —— 已退出则立即升级、仍运行则等 `exit`、无响应则靠 5 秒 timer，并用一个 latch 保证只发一次信号，`close` 时清 timer。请找出这个时序仍会漏杀或误杀的情形。
 
 2. **`checkPath` 的 `requireResolve` 两个调用点**（`child-guard.ts`）。文件工具传 `true`（不解析即拒），shell 参数传 `false`（保留词法检查）。请核对这个划分：有没有文件工具的路径本该允许不存在的情形；shell 侧保留词法检查是否留下了能读到 workspace 外文件的具体写法。
 
@@ -57,9 +61,11 @@ Pi 的 extension，注册单个 `Workflow` tool。主 agent 传 phase 列表，�
 
 5. **后台交付路径**。tool 立刻返回 run id，跑完 `sendMessage({triggerTurn: true, deliverAs: "followUp"})`；run 被 abort 时不投递。请找 `active` 计数漂移、投递重复、或报告在非 shutdown 情形下丢失的路径。
 
-6. **报告汇总的边界**。转义后的份额收缩、`unused` 检测（只有 completed 的 task 算消费了上游）、`lastPhase` 选取。请构造能让有效证据静默消失或报告超出 `MAX_REPORT_CHARS` 的输入。
+6. **报告汇总的边界**。转义后的份额收缩现在把 header 与编码后的 gap 列表算进同一份预算（`overhead` / `reportCap`）。请构造能让有效证据静默消失、或让最终返回值超出 `MAX_REPORT_CHARS` 的输入 —— 注意 `overhead` 依赖 `gaps` 与 `header` 已先构造，这个求值顺序刚出过一次 temporal dead zone。
 
 7. **死代码与可合并的重复**。`index.ts` 与 `child-guard.ts` 里还有没有无人调用的函数、不可达分支、或两处几乎相同的逻辑。给出调用路径依据。
+
+8. **上一轮已修两条的回归面**。（a）`terminate()` 在 leader 已退出时调用的路径；（b）header 与报告共用预算。这两处刚改完，请专门验证有没有引入新的失效模式。
 
 ## 硬约束
 
@@ -69,7 +75,8 @@ Pi 的 extension，注册单个 `Workflow` tool。主 agent 传 phase 列表，�
 - 不要建议做独立的规划 agent 决定任务数。
 - 不要报 shell 命令白名单的覆盖面（见取舍 10）。
 - 防御要成比例：不为基本不可能发生的情况加分支、断言或 try/except。
+- 不要建议下调 token/超时预算，也不要把消耗量本身当缺陷（见取舍 11）。
 
 ## 交付格式
 
-每条给：`文件:行号 → 一句话缺陷 → 触发条件 → 后果 → 最小修补（≤5 行代码）`。按严重度排序，最多 10 条。判定"实现正确"的项用一行说明依据。第 1、3、7 项无论结论如何都要明确表态。最后一句总体判断：能不能直接用，最该先修哪一条。
+每条给：`文件:行号 → 一句话缺陷 → 触发条件 → 后果 → 最小修补（≤5 行代码）`。按严重度排序，最多 10 条。判定"实现正确"的项用一行说明依据。第 0、1、7、8 项无论结论如何都要明确表态。最后一句总体判断：能不能直接用，最该先修哪一条。
