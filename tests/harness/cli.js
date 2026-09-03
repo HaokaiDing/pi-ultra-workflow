@@ -78,13 +78,25 @@ if (process.argv.includes("--mode")) {
 		trace("end-tagged");
 		process.exit(0);
 	}
+	// A deep worker: usage is cumulative per turn (as real Pi reports it) and keeps
+	// climbing past any per-task budget, with useful text already on the wire.
+	if (mine.includes("BEHAVIOR=spendy")) {
+		emit("VERDICT — partial finding so far", 40_000, "toolUse");
+		emit("VERDICT — partial finding so far", 90_000, "toolUse");
+		await new Promise((r) => setTimeout(r, 3_000));
+		emit("VERDICT — should never be reached", 200_000);
+		trace("end-spendy");
+		process.exit(0);
+	}
 	// Multi-round tool loop: streamed usage plus two toolUse turns before the end.
 	if (mine.includes("BEHAVIOR=multiround")) {
+		// Cumulative usage, the way real Pi reports it: each turn's totalTokens
+		// includes everything before it.
 		process.stdout.write(`${JSON.stringify({ type: "message_update", usage: { totalTokens: 40_000 } })}\n`);
 		emit("thinking", 60_000, "toolUse");
-		emit("still thinking", 60_000, "toolUse");
+		emit("still thinking", 110_000, "toolUse");
 		await new Promise((r) => setTimeout(r, 800));
-		emit("multiround done", 60_000);
+		emit("multiround done", 150_000);
 		trace("end-multiround");
 		process.exit(0);
 	}
@@ -283,7 +295,11 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("multiround run returns", result.ok, result.text.slice(0, 160));
 	const started = trace().filter((e) => e.event === "start").map((e) => e.taskId);
 	record("in-flight tokens gate further dispatch", started.length < 5, `started=${started.join(",")}`);
-	record("multiround tokens are counted", /tokens=1[0-9]{5}/.test(result.text), result.text.split("\n")[1] ?? "");
+	// Turn two reports a cumulative 110k, which trips the per-task ceiling (80k,
+	// clamped to the run budget) before turn three. Under the old summing bug the
+	// same point would read 170k, so this number is the fix's fingerprint.
+	record("multiround counts the high-water mark, not the sum", /tokens=11[0-9]{4}/.test(result.text), result.text.split("\n")[1] ?? "");
+	record("multiround task was cut at its budget", /cut off at the .*-token task budget/.test(result.text), "");
 }
 
 // 10 - Evidence nobody consumed is reported as unused (finding #7).
@@ -412,6 +428,23 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	const readerPrompt = trace().find((e) => e.taskId === "reader" && e.rawPrompt !== undefined)?.rawPrompt ?? "";
 	record("injected task tag does not appear unescaped", !/<your_task id="injected"/.test(readerPrompt), readerPrompt.slice(-160));
 	record("exactly one your_task element in the prompt", (readerPrompt.match(/<your_task /g) ?? []).length === 1, `${(readerPrompt.match(/<your_task /g) ?? []).length}`);
+}
+
+// 15 - A single task cannot outspend the run budget, and its partial answer survives.
+{
+	const result = await run({
+		objective: "per-task budget",
+		maxTotalTokens: 200_000,
+		maxTokensPerTask: 50_000,
+		phases: [{ name: "p", tasks: [task("greedy", "spendy"), task("cheap", "ok")] }],
+	});
+	record("budget-cut run completes", result.ok, result.text.slice(0, 140));
+	record("partial answer is kept", /partial finding so far/.test(result.text), "");
+	record("cut-off is labelled", /cut off at the 50000-token task budget/.test(result.text), "");
+	record("greedy task is not counted as a gap", !/"taskId":"greedy"/.test(result.text.split("<untrusted")[0]), result.text.split("\n").find((l) => l.includes("gap")) ?? "(no gap line)");
+	const total = Number(/tokens=([0-9]+)/.exec(result.text)?.[1] ?? 0);
+	record("cumulative usage is not summed per turn", total > 0 && total < 120_000, `tokens=${total}`);
+	record("healthy sibling still produced evidence", /cheap ok/.test(result.text), "");
 }
 
 const failed = results.filter((r) => !r.pass);

@@ -14,6 +14,10 @@ const DEFAULT_TASK_TIMEOUT_SECONDS = 300;
 const MAX_TASK_TIMEOUT_SECONDS = 900;
 const DEFAULT_MAX_TOTAL_TOKENS = 250_000;
 const MAX_TOTAL_TOKENS = 1_000_000;
+// Without a per-task ceiling the run budget is unenforceable: concurrent workers
+// all clear the gate before any of them has reported usage, and a max-effort child
+// will spend six figures inside its wall-clock deadline.
+const DEFAULT_MAX_TOKENS_PER_TASK = 80_000;
 const MAX_RESULT_CHARS = 24_000;
 const MAX_REPORT_CHARS = 48_000;
 const MIN_REPORT_SHARE = 256;
@@ -73,6 +77,7 @@ const WorkflowSchema = Type.Object({
 	background: Type.Optional(Type.Boolean({ description: "Return immediately and deliver the report when the run finishes (default true). Set false to block until it is done." })),
 	taskTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 30, maximum: MAX_TASK_TIMEOUT_SECONDS, description: "Per-task deadline (default 300)" })),
 	maxTotalTokens: Type.Optional(Type.Integer({ minimum: 10_000, maximum: MAX_TOTAL_TOKENS, description: "Cumulative token ceiling for the whole run (default 250000)" })),
+	maxTokensPerTask: Type.Optional(Type.Integer({ minimum: 5_000, maximum: 400_000, description: "Hard token ceiling for a single task; it is cut off and its partial answer kept (default 80000)" })),
 });
 
 type WorkflowInput = Static<typeof WorkflowSchema>;
@@ -97,6 +102,7 @@ interface Run {
 	cwd: string;
 	taskTimeoutMs: number;
 	maxTotalTokens: number;
+	maxTokensPerTask: number;
 	totalTokens: number;
 	startedAt: number;
 	phases: { name: string; tasks: Task[] }[];
@@ -215,6 +221,7 @@ function plan(input: WorkflowInput, cwd: string): Run {
 		cwd,
 		taskTimeoutMs: (input.taskTimeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS) * 1_000,
 		maxTotalTokens: input.maxTotalTokens ?? DEFAULT_MAX_TOTAL_TOKENS,
+		maxTokensPerTask: Math.min(input.maxTokensPerTask ?? DEFAULT_MAX_TOKENS_PER_TASK, input.maxTotalTokens ?? DEFAULT_MAX_TOTAL_TOKENS),
 		totalTokens: 0,
 		startedAt: Date.now(),
 		phases,
@@ -392,6 +399,7 @@ async function runChild(
 		let bytes = 0;
 		let tokens = 0;
 		let forced: Error | undefined;
+		let budgetCut = false;
 		let settled = false;
 
 		const deadline = setTimeout(() => {
@@ -429,15 +437,23 @@ async function runChild(
 			if (event?.type === "message_update") {
 				const live = event.usage?.totalTokens;
 				if (typeof live === "number" && Number.isFinite(live) && live > 0) {
-					inFlight.set(task.id, Math.max(inFlight.get(task.id) ?? 0, tokens + live));
+					inFlight.set(task.id, Math.max(inFlight.get(task.id) ?? 0, tokens, live));
 				}
 				return;
 			}
 			if (event?.type !== "message_end" || event.message?.role !== "assistant") return;
 			const body = assistantText(event.message);
 			if (body) text = body;
+			// `totalTokens` is cumulative within the child's session, not per turn, so
+			// summing it squares the count: a twenty-turn child reported ten times its
+			// real spend. Take the high-water mark instead.
 			const turnTokens = event.message?.usage?.totalTokens;
-			if (typeof turnTokens === "number" && Number.isFinite(turnTokens)) tokens += turnTokens;
+			if (typeof turnTokens === "number" && Number.isFinite(turnTokens)) tokens = Math.max(tokens, turnTokens);
+			if (tokens > run.maxTokensPerTask && !forced) {
+				budgetCut = true;
+				forced = new Error(`Task ${task.id} hit its ${run.maxTokensPerTask}-token budget.`);
+				terminate(proc);
+			}
 			if (typeof event.message?.stopReason === "string") stopReason = event.message.stopReason;
 			// A tool-use turn is not the end of the task: keep the tokens already
 			// spent visible to the budget, since run.totalTokens only sees them
@@ -485,7 +501,19 @@ async function runChild(
 		proc.on("close", (code, closeSignal) => {
 			buffer += decoder.end();
 			if (buffer.trim()) processLine(buffer);
-			if (forced) return finish(forced);
+			if (forced) {
+				// A task cut off at its budget usually has a partial answer worth keeping;
+				// losing it would mean paying the whole budget for nothing.
+				const partial = text.trim();
+				if (budgetCut && partial) {
+					return finish(undefined, {
+						text: `${clip(partial, MAX_RESULT_CHARS)}\n[cut off at the ${run.maxTokensPerTask}-token task budget; this answer may be incomplete]`,
+						tokens,
+						truncated: true,
+					});
+				}
+				return finish(forced);
+			}
 			if (signal.aborted) return finish(new Error(`Task ${task.id} was cancelled.`));
 			// `--mode json` always exits 0, so stopReason carries the real verdict.
 			// "length" means the model hit its own output cap: keep what it did say.

@@ -63,7 +63,7 @@ The main agent calls one tool:
   thrown away, so the run mode is what decides.
 - A per-run journal lands in `~/.pi/agent/ultra-workflow/runs/<run-id>.json`.
 
-Defaults: 8 tasks, 4 phases, 3 concurrent, 300 s per task, 250 000 tokens per run.
+Defaults: 8 tasks, 4 phases, 3 concurrent, 300 s per task, 80 000 tokens per task, 250 000 per run.
 
 Any project directory works. A marker (`.git`, `package.json`, `pyproject.toml`, `Makefile`, …) at or above the
 directory settles it; failing that, any directory nested at least two levels under Home counts, since plenty of
@@ -133,8 +133,9 @@ Behavioural choices worth knowing:
 
 ## Known limitations
 
-1. `maxTotalTokens` is a dispatch gate plus in-flight accounting, not a hard cap. A task already dispatched
-   runs to completion, so the real ceiling is roughly the budget plus one round per concurrent child.
+1. `maxTotalTokens` is a dispatch gate, not a hard cap — concurrent workers all clear it before any of them
+   has reported usage. `maxTokensPerTask` (default 80 000) is the enforceable one: a task that reaches it is cut
+   off and its partial answer kept. Worst case is roughly the per-task ceiling times the concurrency.
 2. Pi ships no web or fetch tool, so children cannot search the web. Literature and web work stays in the
    main agent.
 3. The shell policy is a coarse filter with known gaps, not a boundary you can lean on for untrusted code
@@ -152,7 +153,7 @@ No dependencies, no network, no API calls.
 
 ```bash
 node tests/verify.mjs          # 132 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 56 checks: real spawns via a stub child (~65s, includes a 30s deadline)
+node tests/harness/cli.js      # 63 checks: real spawns via a stub child (~70s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only
