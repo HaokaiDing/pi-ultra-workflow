@@ -343,9 +343,21 @@ function terminate(proc: ChildProcessWithoutNullStreams): void {
 			// The group is already gone.
 		}
 	};
-	const escalation = setTimeout(escalate, 5_000);
+	// Three ways in, because the leader's state at call time decides which applies:
+	// already gone (escalate now, while the pid is still ours), still running (wait
+	// for its exit), or unresponsive (the timer). Waiting on `exit` alone loses the
+	// first case entirely — the event has already fired and the close that follows
+	// would cancel the timer.
+	let escalated = false;
+	const escalateOnce = () => {
+		if (escalated) return;
+		escalated = true;
+		escalate();
+	};
+	const escalation = setTimeout(escalateOnce, 5_000);
 	escalation.unref();
-	proc.once("exit", escalate);
+	if (proc.exitCode !== null || proc.signalCode !== null) escalateOnce();
+	else proc.once("exit", escalateOnce);
 	proc.once("close", () => clearTimeout(escalation));
 }
 
@@ -677,16 +689,6 @@ async function execute(run: Run, signal: AbortSignal, children: Set<ChildProcess
 			};
 		});
 
-	let share = Math.floor(MAX_REPORT_CHARS / chosen.length);
-	let report = buildReport(share);
-	for (let attempt = 0; attempt < 3 && safeJson(report).length > MAX_REPORT_CHARS; attempt++) {
-		share = Math.max(MIN_REPORT_SHARE, Math.floor((share * MAX_REPORT_CHARS) / safeJson(report).length));
-		report = buildReport(share);
-	}
-	// Proportional shrinking is a no-op while `share` already exceeds the bodies, so
-	// three rounds do not guarantee reaching the floor. Land on it explicitly.
-	if (safeJson(report).length > MAX_REPORT_CHARS) report = buildReport(MIN_REPORT_SHARE);
-
 	// stderr reaches these strings, so they are untrusted: encode and cap them
 	// rather than letting newlines or tag-shaped text escape the report structure.
 	const gaps = tasks
@@ -705,6 +707,22 @@ async function execute(run: Run, signal: AbortSignal, children: Set<ChildProcess
 	if (run.stopReason) header.push(`stopped early: ${run.stopReason}`);
 	if (gaps.length > 0) header.push(`untrusted evidence gaps (${gaps.length}): ${safeJson(gaps)}`);
 	if (unused.length > 0) header.push(`unused evidence (${unused.length}): ${unused.map((task) => task.id).join(", ")} — nothing consumed it; read the journal`);
+
+	// The cap covers what is actually returned, so the header and the encoded gap
+	// list come out of the same budget — they are appended after the report and can
+	// add several kilobytes of their own once escaped.
+	const overhead = safeJson(gaps).length + header.join("\n").length + 256;
+	const reportCap = Math.max(MIN_REPORT_SHARE, MAX_REPORT_CHARS - overhead);
+
+	let share = Math.floor(reportCap / chosen.length);
+	let report = buildReport(share);
+	for (let attempt = 0; attempt < 3 && safeJson(report).length > reportCap; attempt++) {
+		share = Math.max(MIN_REPORT_SHARE, Math.floor((share * reportCap) / safeJson(report).length));
+		report = buildReport(share);
+	}
+	// Proportional shrinking is a no-op while `share` already exceeds the bodies, so
+	// three rounds do not guarantee reaching the floor. Land on it explicitly.
+	if (safeJson(report).length > reportCap) report = buildReport(MIN_REPORT_SHARE);
 
 	return [
 		...header,

@@ -65,6 +65,20 @@ if (process.argv.includes("--mode")) {
 		trace("end-hostile");
 		process.exit(0);
 	}
+	// A near-cap successful answer, used together with failures whose diagnostics
+	// inflate the header — the combination that overran the declared total.
+	if (mine.includes("BEHAVIOR=bulky")) {
+		emit("B".repeat(46_000), 500);
+		trace("end-bulky");
+		process.exit(0);
+	}
+	// Fails with a long, escape-inflating diagnostic on stderr.
+	if (mine.includes("BEHAVIOR=noisyfail")) {
+		process.stderr.write(`${"<".repeat(400)}\n`);
+		emit("partial", 50, "aborted");
+		trace("end-noisyfail");
+		process.exit(0);
+	}
 	// The exact shape that defeated proportional shrinking: bodies small enough that
 	// lowering the share is a no-op, but numerous enough to blow the encoded budget.
 	if (mine.includes("BEHAVIOR=shrinkproof")) {
@@ -480,6 +494,21 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("stream-limit run returns", result.ok, result.text.slice(0, 120));
 	record("flooding task is reported as a gap", /"taskId":"flood"/.test(result.text), "");
 	record("healthy sibling survives the flood", /ok1 ok/.test(result.text), "");
+}
+
+// 18 - The declared cap covers the whole returned report, header included.
+{
+	const result = await run({
+		objective: "total size",
+		phases: [{ name: "p", tasks: [
+			task("big", "bulky"),
+			...["n1", "n2", "n3", "n4", "n5", "n6", "n7"].map((id) => task(id, "noisyfail")),
+		] }],
+	});
+	record("mixed bulky/noisy run completes", result.ok, result.text.slice(0, 120));
+	record("whole report honours MAX_REPORT_CHARS", result.text.length <= 48_000, `report chars=${result.text.length}`);
+	record("noisy diagnostics still reach the header", /untrusted evidence gaps \(7\)/.test(result.text), result.text.split("\n").find((l) => l.includes("gap"))?.slice(0, 80) ?? "");
+	record("bulky evidence is kept but trimmed", /"trimmed":true/.test(result.text) && /BBBB/.test(result.text), "");
 }
 
 const failed = results.filter((r) => !r.pass);

@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-806 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
+826 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -159,7 +159,7 @@ No dependencies, no network, no API calls.
 
 ```bash
 node tests/verify.mjs          # 135 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 68 checks: real spawns via a stub child (~80s, includes a 30s deadline)
+node tests/harness/cli.js      # 72 checks: real spawns via a stub child (~85s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only
