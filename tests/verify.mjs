@@ -43,17 +43,23 @@ writeFileSync(join(PROJ, "scripts", "check.py"), "print(1)\n");
 // A link that lives inside the workspace but points out of it, plus a benign one.
 symlinkSync("/etc", join(PROJ, "escape"), "dir");
 // Directory shapes that mirror real project layouts, to pin the workspace rule.
-const HOME = homedir();
+// A fake Home under tmpdir. The scheduler reads homedir(), which honours $HOME on
+// POSIX, so the workspace rule can be exercised without touching the real Home.
 const SHAPES = join(TMP, "shapes");
 rmSync(SHAPES, { recursive: true, force: true });
+const HOME = join(SHAPES, "home");
+mkdirSync(HOME, { recursive: true });
+// getAgentDir() also derives from HOME, so pin the real agent dir before swapping
+// it — otherwise the child guard path would move with the fake Home.
+process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+process.env.HOME = HOME;
+
 // A plain folder of files two levels under Home, with no marker at all.
-const nestedNoMarker = join(HOME, ".pi-wf-test-shapes", "some-paper");
-rmSync(join(HOME, ".pi-wf-test-shapes"), { recursive: true, force: true });
+const nestedNoMarker = join(HOME, "research", "some-paper");
 mkdirSync(nestedNoMarker, { recursive: true });
 writeFileSync(join(nestedNoMarker, "draft.tex"), "\\documentclass{article}\n");
 // One level under Home, no marker.
-const shallowNoMarker = join(HOME, ".pi-wf-test-shallow");
-rmSync(shallowNoMarker, { recursive: true, force: true });
+const shallowNoMarker = join(HOME, "loose");
 mkdirSync(shallowNoMarker, { recursive: true });
 // Outside Home, no marker.
 const outsideNoMarker = join(SHAPES, "outside");
@@ -62,9 +68,24 @@ mkdirSync(outsideNoMarker, { recursive: true });
 const outsideOptedIn = join(SHAPES, "opted-in");
 mkdirSync(outsideOptedIn, { recursive: true });
 writeFileSync(join(outsideOptedIn, ".pi-workflow-root"), "");
-// An umbrella directory that happens to sit under a marker-bearing parent.
-const umbrella = join(HOME, ".pi-wf-test-shapes", "Documents");
+// A container by name, with and without a marker of its own.
+const umbrella = join(HOME, "research", "Documents");
 mkdirSync(umbrella, { recursive: true });
+const umbrellaNamedProject = join(HOME, "research", "tmp");
+mkdirSync(umbrellaNamedProject, { recursive: true });
+writeFileSync(join(umbrellaNamedProject, "package.json"), "{}\n");
+// Credential and system containers that the depth rule must not reach.
+const configDir = join(HOME, ".config", "gh");
+mkdirSync(configDir, { recursive: true });
+const dockerDir = join(HOME, ".docker", "contexts");
+mkdirSync(dockerDir, { recursive: true });
+// The .pi case needs to exist too: the tool realpaths its cwd before validating.
+const piConfigDir = join(HOME, ".pi", "agent");
+mkdirSync(piConfigDir, { recursive: true });
+const appSupport = join(HOME, "Library", "Application Support");
+mkdirSync(appSupport, { recursive: true });
+const cloudStorage = join(HOME, "Library", "CloudStorage", "SomeDrive");
+mkdirSync(cloudStorage, { recursive: true });
 
 
 symlinkSync(join(PROJ, "src"), join(PROJ, "src-link"), "dir");
@@ -122,10 +143,14 @@ record("non-Pi host cannot spawn children", /is not a Pi entrypoint/.test(spawnG
 
 for (const [name, cwd, pattern] of [
 	["Home workspace rejected", homedir(), /Home or an ancestor/],
-	["credential dir rejected", join(homedir(), ".pi", "agent"), /protected config or credential/],
+	["credential dir rejected", piConfigDir, /protected config or credential/],
 	["outside Home without marker rejected", outsideNoMarker, /no project marker/],
 	["directly in Home without marker rejected", shallowNoMarker, /directly in Home/],
 	["umbrella dir rejected by name", umbrella, /holds projects rather than being one/],
+	["~/.config/gh rejected", configDir, /protected config or credential/],
+	["~/.docker/contexts rejected", dockerDir, /protected config or credential/],
+	["~/Library/Application Support rejected", appSupport, /inside ~\/Library/],
+	["~/Library/CloudStorage rejected", cloudStorage, /inside ~\/Library/],
 ]) {
 	const message = await call(plan2, { cwd, hasUI: false });
 	record(name, pattern.test(message), message.slice(0, 120));
@@ -136,6 +161,7 @@ for (const [name, cwd, pattern] of [
 for (const [name, cwd] of [
 	["nested folder of files under Home accepted", nestedNoMarker],
 	["outside Home with .pi-workflow-root accepted", outsideOptedIn],
+	["project that happens to be named tmp accepted", umbrellaNamedProject],
 ]) {
 	const message = await call({ objective: "o", phases: [{ name: "p", tasks: [task("a")] }] }, { cwd, hasUI: false });
 	record(name, /adds nothing/.test(message), message.slice(0, 110));
