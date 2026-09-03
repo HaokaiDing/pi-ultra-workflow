@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-826 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
+842 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -63,7 +63,9 @@ The main agent calls one tool:
   thrown away, so the run mode is what decides.
 - A per-run journal lands in `~/.pi/agent/ultra-workflow/runs/<run-id>.json`.
 
-Defaults: 8 tasks, 4 phases, 3 concurrent, 300 s per task, 80 000 tokens per task, 250 000 per run.
+Defaults: 8 tasks, 4 phases, 3 concurrent, 900 s per task, 250 000 tokens per task, 1 500 000 per run.
+The ceilings are runaway protection, not rationing — set high enough that a deep review finishes inside them.
+Lowering them mostly buys a worker cut off before it wrote anything down; reduce the task count instead.
 
 Any project directory works. A marker (`.git`, `package.json`, `pyproject.toml`, `Makefile`, …) at or above the
 directory settles it; failing that, any directory nested at least two levels under Home counts, since plenty of
@@ -142,15 +144,18 @@ Behavioural choices worth knowing:
    off and its partial answer kept. Worst case is roughly the per-task ceiling times the concurrency. Token
    counts sum each response's `totalTokens`, which includes `cacheRead`, so a cached prefix is counted once per
    request — the figure overstates billed cost and errs toward stopping early.
-2. Pi ships no web or fetch tool, so children cannot search the web. Literature and web work stays in the
+2. Report size is bounded by the caller's context window rather than by cost: `MAX_RESULT_CHARS` (32 000 per
+   task) and `MAX_REPORT_CHARS` (80 000 for the whole report, header included) exist so a wide fan-out cannot
+   flood the main agent's conversation. Full answers stay in the journal.
+3. Pi ships no web or fetch tool, so children cannot search the web. Literature and web work stays in the
    main agent.
-3. The shell policy is a coarse filter with known gaps, not a boundary you can lean on for untrusted code
+4. The shell policy is a coarse filter with known gaps, not a boundary you can lean on for untrusted code
    (see "Child boundary"). `shell: false` children are unaffected.
-4. Long runs occupy the Pi session, since the call is synchronous.
-5. `MODEL` is a constant. Multi-model runs need an edit.
-6. `git log -p` and `git show` print the contents of files as they exist in history, including ones the
+5. Long runs occupy the Pi session, since the call is synchronous.
+6. `MODEL` is a constant. Multi-model runs need an edit.
+7. `git log -p` and `git show` print the contents of files as they exist in history, including ones the
    secret-name rules protect. Do not commit credentials; the guard cannot un-commit them.
-7. macOS and Linux only. Process-group kills, `detached` spawning and the path checks are POSIX-shaped, so the
+8. macOS and Linux only. Process-group kills, `detached` spawning and the path checks are POSIX-shaped, so the
    tool refuses to start on Windows rather than pretending to enforce its boundary there.
 
 ## Tests

@@ -10,18 +10,25 @@ const MODEL = "openai-codex/gpt-5.6-sol";
 const MAX_TASKS = 8;
 const MAX_PHASES = 4;
 const CONCURRENCY = 3;
-const DEFAULT_TASK_TIMEOUT_SECONDS = 300;
-const MAX_TASK_TIMEOUT_SECONDS = 900;
-const DEFAULT_MAX_TOTAL_TOKENS = 250_000;
-const MAX_TOTAL_TOKENS = 1_000_000;
+// The ceilings exist to stop a runaway, not to ration. An unbounded worker once
+// burned three million tokens across three tasks and returned nothing, so the
+// limits stay — set high enough that a deep review finishes inside them. Reviewing
+// a few hundred lines of code measures at 40-60k, so a worker gets several times
+// that before anything cuts it off.
+const DEFAULT_TASK_TIMEOUT_SECONDS = 900;
+const MAX_TASK_TIMEOUT_SECONDS = 3_600;
+const DEFAULT_MAX_TOTAL_TOKENS = 1_500_000;
+const MAX_TOTAL_TOKENS = 6_000_000;
 // Without a per-task ceiling the run budget is unenforceable: concurrent workers
-// all clear the gate before any of them has reported usage, and a max-effort child
-// will spend six figures inside its wall-clock deadline.
-const DEFAULT_MAX_TOKENS_PER_TASK = 80_000;
-const MAX_RESULT_CHARS = 24_000;
-const MAX_REPORT_CHARS = 48_000;
+// all clear the gate before any of them has reported usage.
+const DEFAULT_MAX_TOKENS_PER_TASK = 250_000;
+// These two are bounded by the caller's context window rather than by cost: every
+// character here lands in the main agent's conversation.
+const MAX_RESULT_CHARS = 32_000;
+const MAX_REPORT_CHARS = 80_000;
 const MIN_REPORT_SHARE = 256;
-const MAX_FANIN_CHARS = 96_000;
+// Wide enough that eight full-length upstream answers reach a synthesis intact.
+const MAX_FANIN_CHARS = 280_000;
 const MAX_STDERR_CHARS = 2_000;
 const MAX_EVENT_BYTES = 2_000_000;
 const CHILD_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -75,9 +82,9 @@ const WorkflowSchema = Type.Object({
 		{ minItems: 1, maxItems: MAX_PHASES },
 	),
 	background: Type.Optional(Type.Boolean({ description: "Return immediately and deliver the report when the run finishes (default true). Set false to block until it is done." })),
-	taskTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 30, maximum: MAX_TASK_TIMEOUT_SECONDS, description: "Per-task deadline (default 300)" })),
-	maxTotalTokens: Type.Optional(Type.Integer({ minimum: 10_000, maximum: MAX_TOTAL_TOKENS, description: "Cumulative token ceiling for the whole run (default 250000)" })),
-	maxTokensPerTask: Type.Optional(Type.Integer({ minimum: 5_000, maximum: 400_000, description: "Hard token ceiling for a single task; it is cut off and its partial answer kept (default 80000)" })),
+	taskTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 30, maximum: MAX_TASK_TIMEOUT_SECONDS, description: "Per-task deadline in seconds (default 900)" })),
+	maxTotalTokens: Type.Optional(Type.Integer({ minimum: 10_000, maximum: MAX_TOTAL_TOKENS, description: "Cumulative token ceiling for the whole run (default 1500000)" })),
+	maxTokensPerTask: Type.Optional(Type.Integer({ minimum: 5_000, maximum: 2_000_000, description: "Hard token ceiling for a single task; it is cut off and its partial answer kept (default 250000). Raise it for deep work; lowering it usually just buys a cut-off worker with nothing written yet." })),
 });
 
 type WorkflowInput = Static<typeof WorkflowSchema>;
@@ -749,6 +756,7 @@ export default function ultraWorkflow(pi: ExtensionAPI): void {
 			`Fan out 2-${MAX_TASKS} read-only ${MODEL} agents over sequential phases inside a marked project directory, then read their evidence back. ` +
 			"Scale the task count to the question: a single fact you can settle in a few tool calls belongs in this session, a direct comparison wants 2-4 tasks, " +
 			"and only a broad audit wants more. Three focused tasks beat five vague ones. Do not add a task to double-check another task's work. " +
+			"Effort defaults to high for scouts and max for a final synthesis; ask for max on a scout when the work needs real depth. " +
 			`Up to ${CONCURRENCY} run at once; in a multi-phase run the last phase defaults to max effort with Fast, and an explicit per-task effort overrides that. ` +
 			"A failing task becomes a reported evidence gap rather than a dead run. " +
 			"Runs in the background by default and delivers its report on its own, so start it and carry on with other work rather than waiting. " +
