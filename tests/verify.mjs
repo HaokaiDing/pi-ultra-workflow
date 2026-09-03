@@ -91,6 +91,9 @@ mkdirSync(cloudStorage, { recursive: true });
 
 
 symlinkSync(join(PROJ, "src"), join(PROJ, "src-link"), "dir");
+// An ordinary-looking filename that is really a link out of the workspace.
+writeFileSync(join(TMP, "outside-plain.txt"), "secret from outside\n");
+symlinkSync(join(TMP, "outside-plain.txt"), join(PROJ, "plain.txt"), "file");
 
 
 const results = [];
@@ -233,6 +236,13 @@ const guardCases = [
 	["#1 unicode-space path is not a bypass", "read", { path: ".env\u00A0" }, false, true],
 	["#2 glob shorthand blocked", "bash", { command: "head .e??" }, true, true],
 	["#2 glob star blocked", "bash", { command: "head *.pem" }, true, true],
+	// A bare filename gets no shape-based exemption: it can be a link out.
+	["bare-name symlink out blocked (head)", "bash", { command: "head plain.txt" }, true, true],
+	["bare-name symlink out blocked (wc)", "bash", { command: "wc -l plain.txt" }, true, true],
+	["bare-name symlink out blocked (nl)", "bash", { command: "nl plain.txt" }, true, true],
+	["dot-prefixed form was already blocked", "bash", { command: "head ./plain.txt" }, true, true],
+	["ordinary in-workspace file still allowed", "bash", { command: "wc -l src/a.ts" }, true, false],
+	["non-path argument still allowed", "bash", { command: "pytest -k smoke" }, true, false],
 	["unresolvable file path blocked for read", "read", { path: "does/not/exist.ts" }, false, true],
 	["#2 bracket glob blocked", "bash", { command: "head [a-z].pem" }, true, true],
 	["#2 git rev secret path blocked", "bash", { command: "git show HEAD:.env" }, true, true],

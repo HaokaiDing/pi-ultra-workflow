@@ -166,14 +166,16 @@ function checkCommand(command: string, root: string): string | undefined {
 			const revisionPath = token.slice(colon + 1);
 			if (revisionPath.split("/").some(isSecretName)) return `revision path is protected: ${token}`;
 		}
-		// Options carry paths too, so their values get the same treatment.
+		// Options carry paths too, so their values get the same treatment. Every
+		// candidate is checked, with no shape test first: a bare `plain.txt` looks
+		// like nothing special and can still be a symlink pointing out of the
+		// workspace. Names that are not paths at all resolve inside the workspace and
+		// pass harmlessly.
 		const candidate = token.startsWith("-") ? flagValue(token) : token;
 		if (candidate === undefined) continue;
 		if (candidate.includes("..")) return `path traversal in "${token}"`;
-		if (candidate.includes("/") || candidate.startsWith(".") || isAbsolute(candidate)) {
-			const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root, false);
-			if (problem) return problem;
-		}
+		const { problem } = checkPath(candidate.replace(/^["']|["']$/g, ""), root, false);
+		if (problem) return problem;
 	}
 	return undefined;
 }

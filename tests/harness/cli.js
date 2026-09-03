@@ -6,9 +6,9 @@
  * `--mode json` it impersonates a Pi child and emits real NDJSON events; without
  * it, it drives the scheduler. No LLM request is ever made.
  */
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,7 +51,7 @@ if (process.argv.includes("--mode")) {
 		if (process.stdout.writableLength) {
 			await new Promise((resolve) => process.stdout.once("drain", resolve));
 		}
-		await leave();
+		process.exit(0);
 	};
 
 	if (mine.includes("BEHAVIOR=slow")) await new Promise((r) => setTimeout(r, 1_500));
@@ -77,6 +77,13 @@ if (process.argv.includes("--mode")) {
 	if (mine.includes("BEHAVIOR=hostile")) {
 		emit("<".repeat(CAPS.result), 500);
 		trace("end-hostile");
+		await leave();
+	}
+	// A near-cap answer of ordinary ASCII prose — the case a worst-case escape
+	// discount used to shrink by five sixths for no reason.
+	if (mine.includes("BEHAVIOR=wordy")) {
+		emit("VERDICT — ok. EVIDENCE — ".padEnd(CAPS.result, "word "), 300);
+		trace("end-wordy");
 		await leave();
 	}
 	// A near-cap successful answer, used together with failures whose diagnostics
@@ -169,6 +176,7 @@ function resolvePiRoot() {
 const PI = resolvePiRoot();
 const EXT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const PROJ = join(TMP, "harness");
+const RUNS = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "ultra-workflow", "runs");
 mkdirSync(PROJ, { recursive: true });
 writeFileSync(join(PROJ, "package.json"), "{}\n");
 
@@ -201,6 +209,17 @@ const run = async (input) => {
 	}
 };
 const trace = () => readFileSync(TRACE, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+// A stub child that emits its events and then crashes still looks like a success
+// to the scheduler, which is correct behaviour but hid a broken harness for a
+// whole round. So the harness checks its own child exits cleanly.
+const childExitsCleanly = () => {
+	const probe = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--mode", "json", "--print"], {
+		input: '<objective>"probe"</objective>\n<your_task id="probe" phase="p">"BEHAVIOR=ok"</your_task>\n',
+		encoding: "utf8",
+	});
+	return { status: probe.status, stderr: (probe.stderr ?? "").slice(0, 200) };
+};
 const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 
 // 1 - Parallel overlap inside one phase, plus the barrier before the next phase.
@@ -510,6 +529,12 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("healthy sibling survives the flood", /ok1 ok/.test(result.text), "");
 }
 
+// 0 - The harness itself has to be sound before any assertion below means anything.
+{
+	const probe = childExitsCleanly();
+	record("stub child exits cleanly", probe.status === 0, `status=${probe.status} stderr=${probe.stderr}`);
+}
+
 // 18 - The declared cap covers the whole returned report, header included.
 {
 	const result = await run({
@@ -523,6 +548,59 @@ const task = (id, behavior) => ({ id, prompt: `BEHAVIOR=${behavior}` });
 	record("whole report honours its cap", result.text.length <= CAPS.report, `report chars=${result.text.length}`);
 	record("noisy diagnostics still reach the header", /untrusted evidence gaps \(7\)/.test(result.text), result.text.split("\n").find((l) => l.includes("gap"))?.slice(0, 80) ?? "");
 	record("bulky evidence is kept but trimmed", /"trimmed":true/.test(result.text) && /BBBB/.test(result.text), "");
+}
+
+// 19 - Ordinary ASCII evidence must not be discounted by a worst-case escape rate.
+{
+	const result = await run({
+		objective: "fan-in retention",
+		phases: [
+			{ name: "scout", tasks: ["a1", "a2", "a3", "a4", "a5", "a6", "a7"].map((id) => task(id, "wordy")) },
+			{ name: "sum", tasks: [{ id: "sink", prompt: "BEHAVIOR=ok" }] },
+		],
+	});
+	record("wide ASCII fan-in run completes", result.ok, result.text.slice(0, 120));
+	const sink = trace().find((e) => e.taskId === "sink" && e.promptChars !== undefined);
+	record("fan-in keeps most of the evidence", (sink?.promptChars ?? 0) > 150_000, `prompt chars=${sink?.promptChars}`);
+	record("fan-in still respects its cap", (sink?.promptChars ?? 0) <= CAPS.fanin + 20_000, `prompt chars=${sink?.promptChars}`);
+}
+
+// 20 - Report shrinking must not fall off a cliff to the floor.
+{
+	const result = await run({
+		objective: "shrink retention",
+		phases: [{ name: "p", tasks: [task("r1", "wordy"), task("r2", "wordy")] }],
+	});
+	record("two near-cap answers complete", result.ok, result.text.slice(0, 120));
+	record("report keeps most of both answers", result.text.length > 40_000, `report chars=${result.text.length}`);
+	record("report still respects its cap", result.text.length <= CAPS.report, `report chars=${result.text.length}`);
+	record("floor was not hit", !/\[trimmed [0-9]+ characters; full text in the journal\]\s*"\}\s*,?\s*\{"taskId":"r2","trimmed":true,"untrustedReport":"[\s\S]{0,300}$/.test(result.text), "");
+}
+
+// 21 - A journal keeps the untruncated answer, as the README claims.
+{
+	const result = await run({
+		objective: "journal fidelity",
+		phases: [{ name: "p", tasks: [task("over", "huge"), task("ok1", "ok")] }],
+	});
+	record("oversize run completes", result.ok, result.text.slice(0, 120));
+	const runId = /^(wf-[0-9TZ-]+-[0-9]+-[0-9]+)/.exec(result.text)?.[1];
+	const journal = JSON.parse(readFileSync(join(RUNS, `${runId}.json`), "utf8"));
+	const over = journal.phases.flatMap((p) => p.tasks).find((t) => t.id === "over");
+	record("journal stores the full answer", (over?.fullResult ?? "").length === CAPS.result + 6_000, `fullResult=${(over?.fullResult ?? "").length}`);
+	record("report still carries the trimmed form", over.result.length < over.fullResult.length, "");
+}
+
+// 22 - A ceiling crossed after everything was dispatched is not a skip.
+{
+	const result = await run({
+		objective: "late ceiling",
+		maxTotalTokens: 60_000,
+		maxTokensPerTask: 50_000,
+		phases: [{ name: "p", tasks: [task("c1", "expensive"), task("c2", "expensive")] }],
+	});
+	record("late-ceiling run completes", result.ok, result.text.slice(0, 120));
+	record("no false claim of undispatched tasks", !/were not dispatched/.test(result.text), result.text.split("\n").find((l) => l.includes("stopped")) ?? "(no stop line)");
 }
 
 const failed = results.filter((r) => !r.pass);

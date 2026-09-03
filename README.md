@@ -4,7 +4,7 @@ A small multi-agent workflow tool for [Pi](https://github.com/earendil-works/pi-
 fans a task out to a few read-only child agents across sequential phases, then hands their evidence back to
 the main agent.
 
-842 lines for the scheduler, 224 for the child boundary. It deliberately has no background mode, no locks and
+878 lines for the scheduler, 236 for the child boundary. It deliberately has no background mode, no locks and
 no resume.
 
 ## Why
@@ -141,7 +141,8 @@ Behavioural choices worth knowing:
 
 1. `maxTotalTokens` is a dispatch gate, not a hard cap — concurrent workers all clear it before any of them
    has reported usage. `maxTokensPerTask` (default 80 000) is the enforceable one: a task that reaches it is cut
-   off and its partial answer kept. Worst case is roughly the per-task ceiling times the concurrency. Token
+   off and its partial answer kept. It is enforced at response boundaries, so a response already in flight can
+   overshoot it — an independent review measured a worst case near twice the nominal figure. Token
    counts sum each response's `totalTokens`, which includes `cacheRead`, so a cached prefix is counted once per
    request — the figure overstates billed cost and errs toward stopping early.
 2. Report size is bounded by the caller's context window rather than by cost: `MAX_RESULT_CHARS` (32 000 per
@@ -163,8 +164,8 @@ Behavioural choices worth knowing:
 No dependencies, no network, no API calls.
 
 ```bash
-node tests/verify.mjs          # 135 checks: loading, tool contract, planner, guard boundaries
-node tests/harness/cli.js      # 72 checks: real spawns via a stub child (~85s, includes a 30s deadline)
+node tests/verify.mjs          # 141 checks: loading, tool contract, planner, guard boundaries
+node tests/harness/cli.js      # 85 checks: real spawns via a stub child (~95s, includes a 30s deadline)
 ```
 
 `tests/harness/cli.js` is named `cli.js` on purpose: the scheduler re-invokes `process.argv[1]` and only
