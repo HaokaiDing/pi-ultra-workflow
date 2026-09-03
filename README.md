@@ -78,14 +78,22 @@ Children get `read`, `grep`, `find`, `ls` — and `bash` only when the task asks
 - destination flags (`--output`, `--out-file`, …) are refused outright, and the **value** of any flag gets the
   same path check as a bare argument (`--output=/tmp/x`, `-f/etc/passwd`)
 
-Every accepted path is rewritten in place as a canonical absolute path — resolving `~`, `@`, `file://` URLs,
-Unicode spaces and symlinks first. Pi's own resolver is idempotent on such a path, so the file Pi opens is
-exactly the one that passed the check.
+For the file tools, every accepted path is rewritten in place as a canonical absolute path — resolving `~`,
+`@`, `file://` URLs, Unicode spaces and symlinks first. Pi's own resolver is idempotent on such a path, so
+the file Pi opens is exactly the one that passed the check. This part is tested against escaping symlinks,
+URL forms and protected names.
 
-**This is a guard against accidents and against injection from repository content. It is not a sandbox** —
-children run as the same user, and they are allowed to run the project's own scripts (`npm run`, `make`,
-`python3 script.py`), which is the whole point of `shell: true`. Treat `shell: true` on a repository you do
-not trust as running that repository's code.
+**The shell policy is a coarse filter, and it is not a sandbox.** An independent review enumerated command
+forms it still lets through — a bare protected filename (`head id_rsa`), shell quote concatenation
+(`head '.''env'`), symlink-following options (`rg --follow`, `ls -LR`), external program hooks
+(`git log --textconv`, `git diff --ext-diff`, `make SHELL=…`), and writer options on otherwise-read-only
+subcommands (`cargo clippy --fix`). A per-option blocklist cannot close that space: every command has dozens
+of options and some of them always reach outside. Closing it properly needs a fixed set of parameterised
+command templates instead of free-form commands, which is not implemented yet.
+
+What this means in practice: `shell: true` is appropriate for auditing **your own** code, where the child is
+your own agent reading your own repository and reporting back to you. Do not point it at code you do not
+trust. The default (`shell: false`) does not have this exposure — those children only get the file tools.
 
 ## Design trade-offs
 
@@ -115,7 +123,8 @@ Behavioural choices worth knowing:
    runs to completion, so the real ceiling is roughly the budget plus one round per concurrent child.
 2. Pi ships no web or fetch tool, so children cannot search the web. Literature and web work stays in the
    main agent.
-3. The shell allowlist is not a sandbox (see above).
+3. The shell policy is a coarse filter with known gaps, not a boundary you can lean on for untrusted code
+   (see "Child boundary"). `shell: false` children are unaffected.
 4. Long runs occupy the Pi session, since the call is synchronous.
 5. `MODEL` is a constant. Multi-model runs need an edit.
 6. `git log -p` and `git show` print the contents of files as they exist in history, including ones the
